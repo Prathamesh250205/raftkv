@@ -18,6 +18,21 @@ survives crashes. Correctness is checked by a randomized chaos test with the
 | Leader failover | **0.5 s** |
 | Verified | linearizable under random partitions, crashes, restarts, 2% message loss and snapshots |
 
+### Surviving chaos, live
+
+![Grafana dashboard during a chaos run](docs/images/grafana-chaos.jpg)
+
+*The Grafana dashboard during `scripts/chaos.sh`: nodes are frozen, crashed and cut off the network
+every few seconds while a client writes.* Writes keep succeeding (yellow), and p99 latency spikes
+during failovers and then recovers on its own. Each step in the term graph is an election. In a
+90-second run with 12 injected failures, 29,463 writes succeeded and 1,324 failed (95.5%). The
+failures were requests that arrived mid-election, which the benchmark client doesn't retry.
+Afterwards, leadership rebalanced to one shard per node by itself.
+
+Terms climb by about 10 per incident rather than 1. A frozen or isolated node keeps starting
+elections, then forces another when it rejoins. **PreVote** fixes this, and it's first on the
+list of next steps.
+
 ## Features
 
 **Raft core** ([`raft/`](raft/))
@@ -278,8 +293,8 @@ multi-machine gains weren't measured here.
 
 ## Limitations and next steps
 
-- [ ] **PreVote** (thesis §9.6): a node that rejoins after a partition still bumps the term once and
-      causes one extra election.
+- [ ] **PreVote** (thesis §9.6): a node that is frozen or cut off keeps incrementing its term, and
+      on rejoining forces extra elections (visible as the term jumps in the chaos screenshot).
 - [ ] **Learners**: a new member counts toward the majority immediately, even while it is still
       catching up.
 - [ ] **Shard splitting**: the shard count is fixed when the cluster is created; shards can move

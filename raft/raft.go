@@ -1,0 +1,678 @@
+// Package raft implements the Raft consensus algorithm (Ongaro & Ousterhout, 2014):
+// leader election, log replication and durable state. Section numbers in comments
+// refer to the extended Raft paper.
+package raft
+
+import (
+	"bytes"
+	"encoding/gob"
+	"errors"
+	"fmt"
+	"log"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+const (
+	HeartbeatInterval  = 50 * time.Millisecond
+	ElectionTimeoutMin = 300 * time.Millisecond
+	ElectionTimeoutMax = 600 * time.Millisecond
+
+	// Caps a single AppendEntries so a far-behind follower catches up in batches.
+	maxEntriesPerRPC = 512
+)
+
+var ErrStopped = errors.New("raft: node stopped")
+
+type State int
+
+const (
+	Follower State = iota
+	Candidate
+	Leader
+)
+
+func (s State) String() string {
+	switch s {
+	case Follower:
+		return "follower"
+	case Candidate:
+		return "candidate"
+	case Leader:
+		return "leader"
+	}
+	return "unknown"
+}
+
+// LogEntry is one replicated command. A nil Command is a leader's no-op entry.
+type LogEntry struct {
+	Term    int
+	Command []byte
+}
+
+// ApplyMsg is delivered on ApplyCh, in log order, once an entry is committed.
+type ApplyMsg struct {
+	Index   int
+	Term    int
+	Command []byte
+}
+
+type Config struct {
+	ID        int
+	Peers     []int // IDs of every node in the cluster, including ID
+	Transport Transport
+	Persister Persister
+	ApplyCh   chan<- ApplyMsg
+	Logger    *log.Logger // nil disables logging
+}
+
+type Status struct {
+	ID           int    `json:"id"`
+	State        string `json:"state"`
+	Term         int    `json:"term"`
+	LeaderID     int    `json:"leader_id"`
+	CommitIndex  int    `json:"commit_index"`
+	LastApplied  int    `json:"last_applied"`
+	LastLogIndex int    `json:"last_log_index"`
+}
+
+type Raft struct {
+	mu        sync.Mutex
+	applyCond *sync.Cond
+
+	id        int
+	peers     []int
+	transport Transport
+	persister Persister
+	applyCh   chan<- ApplyMsg
+	logger    *log.Logger
+
+	// Persistent state (§5, Figure 2). log[0] is a sentinel so real entries start at index 1.
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
+
+	// Volatile state.
+	state       State
+	leaderID    int
+	commitIndex int
+	lastApplied int
+
+	// Leader-only state, reinitialised after each election.
+	nextIndex  map[int]int
+	matchIndex map[int]int
+
+	electionDeadline time.Time
+	lastBroadcast    time.Time
+
+	// Group commit. The leader appends to its in-memory log and lets the flusher
+	// fsync everything appended since the last flush in one write. stateVersion
+	// orders snapshots so a slow flush can never overwrite newer state on disk.
+	flushCh      chan struct{}
+	persistMu    sync.Mutex // serialises Persister.Save; taken after mu, never before
+	stateVersion uint64     // guarded by mu
+	savedVersion uint64     // guarded by persistMu
+
+	// One replicator goroutine per peer keeps a single AppendEntries in flight;
+	// entries appended meanwhile ride along in the next batch.
+	replCh map[int]chan struct{}
+
+	dead   atomic.Bool
+	stopCh chan struct{}
+}
+
+func New(cfg Config) (*Raft, error) {
+	found := false
+	for _, p := range cfg.Peers {
+		if p == cfg.ID {
+			found = true
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("raft: node %d is not in peers %v", cfg.ID, cfg.Peers)
+	}
+
+	r := &Raft{
+		id:         cfg.ID,
+		peers:      append([]int(nil), cfg.Peers...),
+		transport:  cfg.Transport,
+		persister:  cfg.Persister,
+		applyCh:    cfg.ApplyCh,
+		logger:     cfg.Logger,
+		votedFor:   -1,
+		log:        []LogEntry{{Term: 0}},
+		leaderID:   -1,
+		nextIndex:  map[int]int{},
+		matchIndex: map[int]int{},
+		flushCh:    make(chan struct{}, 1),
+		replCh:     map[int]chan struct{}{},
+		stopCh:     make(chan struct{}),
+	}
+	r.applyCond = sync.NewCond(&r.mu)
+	if err := r.restore(); err != nil {
+		return nil, err
+	}
+	r.resetElectionTimerLocked()
+
+	for _, p := range r.peers {
+		if p != r.id {
+			r.replCh[p] = make(chan struct{}, 1)
+			go r.replicator(p)
+		}
+	}
+	go r.ticker()
+	go r.applier()
+	go r.flusher()
+	return r, nil
+}
+
+// Start proposes cmd for replication. It returns immediately; the entry is not yet
+// committed. The caller learns the outcome when (index, term) appears on ApplyCh.
+func (r *Raft) Start(cmd []byte) (index, term int, isLeader bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != Leader || r.killed() {
+		return 0, 0, false
+	}
+	r.log = append(r.log, LogEntry{Term: r.currentTerm, Command: cmd})
+	// No fsync here: the flusher batches it, and only then counts the leader
+	// toward a majority. Followers can receive the entry in parallel.
+	signal(r.flushCh)
+	r.broadcastLocked()
+	return r.lastIndex(), r.currentTerm, true
+}
+
+func (r *Raft) Status() Status {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return Status{
+		ID:           r.id,
+		State:        r.state.String(),
+		Term:         r.currentTerm,
+		LeaderID:     r.leaderID,
+		CommitIndex:  r.commitIndex,
+		LastApplied:  r.lastApplied,
+		LastLogIndex: r.lastIndex(),
+	}
+}
+
+// Stop halts all background work. A stopped node never persists again, so its
+// Persister can be handed to a fresh node to simulate a restart.
+func (r *Raft) Stop() {
+	if !r.dead.CompareAndSwap(false, true) {
+		return
+	}
+	close(r.stopCh)
+	r.mu.Lock()
+	r.applyCond.Broadcast()
+	r.mu.Unlock()
+}
+
+func (r *Raft) killed() bool { return r.dead.Load() }
+
+// ---- RPC handlers ----
+
+type RequestVoteArgs struct {
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+	// On failure, hints that let the leader skip a whole conflicting term at once
+	// instead of decrementing nextIndex one entry per round trip (§5.3).
+	ConflictIndex int
+	ConflictTerm  int // -1 when the follower's log is simply too short
+}
+
+func (r *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.killed() {
+		return ErrStopped
+	}
+	if args.Term > r.currentTerm {
+		r.stepDownLocked(args.Term)
+	}
+	reply.Term = r.currentTerm
+	if args.Term < r.currentTerm {
+		return nil
+	}
+
+	// Election restriction (§5.4.1): only vote for candidates whose log is at least as up to date.
+	upToDate := args.LastLogTerm > r.lastTerm() ||
+		(args.LastLogTerm == r.lastTerm() && args.LastLogIndex >= r.lastIndex())
+	if (r.votedFor == -1 || r.votedFor == args.CandidateID) && upToDate {
+		r.votedFor = args.CandidateID
+		r.persistLocked()
+		r.resetElectionTimerLocked()
+		reply.VoteGranted = true
+	}
+	return nil
+}
+
+func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.killed() {
+		return ErrStopped
+	}
+	reply.Term = r.currentTerm
+	if args.Term < r.currentTerm {
+		return nil
+	}
+	if args.Term > r.currentTerm {
+		r.stepDownLocked(args.Term)
+	} else if r.state == Candidate {
+		r.state = Follower // someone else won this term
+	}
+	reply.Term = r.currentTerm
+	r.leaderID = args.LeaderID
+	r.resetElectionTimerLocked()
+
+	// Consistency check (§5.3).
+	if args.PrevLogIndex > r.lastIndex() {
+		reply.ConflictIndex = r.lastIndex() + 1
+		reply.ConflictTerm = -1
+		return nil
+	}
+	if t := r.log[args.PrevLogIndex].Term; t != args.PrevLogTerm {
+		i := args.PrevLogIndex
+		for i > 1 && r.log[i-1].Term == t {
+			i--
+		}
+		reply.ConflictIndex = i
+		reply.ConflictTerm = t
+		return nil
+	}
+
+	// Append new entries, truncating only on a real conflict so that a delayed,
+	// stale RPC can never erase entries this follower already has.
+	changed := false
+	for i, e := range args.Entries {
+		idx := args.PrevLogIndex + 1 + i
+		if idx <= r.lastIndex() {
+			if r.log[idx].Term == e.Term {
+				continue
+			}
+			r.log = r.log[:idx]
+		}
+		r.log = append(r.log, args.Entries[i:]...)
+		changed = true
+		break
+	}
+	if changed {
+		r.persistLocked()
+	}
+
+	if args.LeaderCommit > r.commitIndex {
+		r.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+		r.applyCond.Broadcast()
+	}
+	reply.Success = true
+	return nil
+}
+
+// ---- Elections ----
+
+func (r *Raft) ticker() {
+	t := time.NewTicker(10 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-t.C:
+		}
+		r.mu.Lock()
+		now := time.Now()
+		if r.state == Leader {
+			if now.Sub(r.lastBroadcast) >= HeartbeatInterval {
+				r.broadcastLocked()
+			}
+		} else if now.After(r.electionDeadline) {
+			r.startElectionLocked()
+		}
+		r.mu.Unlock()
+	}
+}
+
+func (r *Raft) startElectionLocked() {
+	r.state = Candidate
+	r.currentTerm++
+	r.votedFor = r.id
+	r.leaderID = -1
+	r.persistLocked()
+	r.resetElectionTimerLocked()
+	r.logf("election timeout, starting election for term %d", r.currentTerm)
+
+	term := r.currentTerm
+	args := &RequestVoteArgs{
+		Term:         term,
+		CandidateID:  r.id,
+		LastLogIndex: r.lastIndex(),
+		LastLogTerm:  r.lastTerm(),
+	}
+	votes := 1
+	if votes > len(r.peers)/2 {
+		r.becomeLeaderLocked()
+		return
+	}
+	for _, p := range r.peers {
+		if p == r.id {
+			continue
+		}
+		go func(p int) {
+			var reply RequestVoteReply
+			if err := r.transport.RequestVote(p, args, &reply); err != nil {
+				return
+			}
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if reply.Term > r.currentTerm {
+				r.stepDownLocked(reply.Term)
+				return
+			}
+			if r.state != Candidate || r.currentTerm != term || !reply.VoteGranted {
+				return
+			}
+			votes++
+			if votes > len(r.peers)/2 {
+				r.becomeLeaderLocked()
+			}
+		}(p)
+	}
+}
+
+func (r *Raft) becomeLeaderLocked() {
+	r.state = Leader
+	r.leaderID = r.id
+	r.logf("became leader for term %d", r.currentTerm)
+
+	// A no-op entry from the new term lets entries from earlier terms commit (§5.4.2, §8).
+	r.log = append(r.log, LogEntry{Term: r.currentTerm})
+	r.persistLocked()
+	for _, p := range r.peers {
+		r.nextIndex[p] = r.lastIndex()
+		r.matchIndex[p] = 0
+	}
+	r.matchIndex[r.id] = r.lastIndex()
+	r.advanceCommitLocked()
+	r.broadcastLocked()
+}
+
+// stepDownLocked reverts to follower, adopting term if it is newer than ours.
+func (r *Raft) stepDownLocked(term int) {
+	if term > r.currentTerm {
+		r.currentTerm = term
+		r.votedFor = -1
+		r.leaderID = -1
+		r.persistLocked()
+	}
+	if r.state != Follower {
+		r.logf("stepping down to follower in term %d", r.currentTerm)
+	}
+	r.state = Follower
+}
+
+func (r *Raft) resetElectionTimerLocked() {
+	spread := int64(ElectionTimeoutMax - ElectionTimeoutMin)
+	r.electionDeadline = time.Now().Add(ElectionTimeoutMin + time.Duration(rand.Int63n(spread)))
+}
+
+// ---- Replication ----
+
+func (r *Raft) broadcastLocked() {
+	r.lastBroadcast = time.Now()
+	for _, ch := range r.replCh {
+		signal(ch)
+	}
+}
+
+// signal wakes a goroutine waiting on ch. Signals that arrive while it is busy
+// coalesce into one, which is what turns a burst of appends into one batch.
+func signal(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Raft) replicator(peer int) {
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-r.replCh[peer]:
+		}
+		r.replicateTo(peer)
+	}
+}
+
+// replicateTo sends one AppendEntries to peer, carrying every entry it is missing
+// (up to maxEntriesPerRPC), or an empty heartbeat if it is up to date.
+func (r *Raft) replicateTo(peer int) {
+	r.mu.Lock()
+	if r.state != Leader || r.killed() {
+		r.mu.Unlock()
+		return
+	}
+	term := r.currentTerm
+	prev := r.nextIndex[peer] - 1
+	end := min(r.lastIndex(), prev+maxEntriesPerRPC)
+	entries := make([]LogEntry, end-prev)
+	copy(entries, r.log[prev+1:end+1])
+	args := &AppendEntriesArgs{
+		Term:         term,
+		LeaderID:     r.id,
+		PrevLogIndex: prev,
+		PrevLogTerm:  r.log[prev].Term,
+		Entries:      entries,
+		LeaderCommit: r.commitIndex,
+	}
+	r.mu.Unlock()
+
+	var reply AppendEntriesReply
+	if err := r.transport.AppendEntries(peer, args, &reply); err != nil {
+		return // unreachable; the next heartbeat retries
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if reply.Term > r.currentTerm {
+		r.stepDownLocked(reply.Term)
+		return
+	}
+	if r.state != Leader || r.currentTerm != term {
+		return
+	}
+
+	if reply.Success {
+		match := prev + len(entries)
+		if match > r.matchIndex[peer] {
+			r.matchIndex[peer] = match
+		}
+		if match+1 > r.nextIndex[peer] {
+			r.nextIndex[peer] = match + 1
+		}
+		r.advanceCommitLocked()
+		if r.nextIndex[peer] <= r.lastIndex() {
+			signal(r.replCh[peer]) // more batches to send
+		}
+		return
+	}
+
+	next := reply.ConflictIndex
+	if reply.ConflictTerm >= 0 {
+		for i := r.lastIndex(); i > 0 && r.log[i].Term >= reply.ConflictTerm; i-- {
+			if r.log[i].Term == reply.ConflictTerm {
+				next = i + 1
+				break
+			}
+		}
+	}
+	next = max(next, r.matchIndex[peer]+1, 1)
+	r.nextIndex[peer] = min(next, r.lastIndex()+1)
+	signal(r.replCh[peer])
+}
+
+// advanceCommitLocked commits the highest index replicated on a majority.
+// Only entries from the current term are committed by counting replicas (§5.4.2).
+func (r *Raft) advanceCommitLocked() {
+	for n := r.lastIndex(); n > r.commitIndex && r.log[n].Term == r.currentTerm; n-- {
+		count := 0
+		for _, p := range r.peers {
+			if r.matchIndex[p] >= n {
+				count++
+			}
+		}
+		if count > len(r.peers)/2 {
+			r.commitIndex = n
+			r.applyCond.Broadcast()
+			return
+		}
+	}
+}
+
+func (r *Raft) applier() {
+	for {
+		r.mu.Lock()
+		for r.lastApplied >= r.commitIndex && !r.killed() {
+			r.applyCond.Wait()
+		}
+		if r.killed() {
+			r.mu.Unlock()
+			return
+		}
+		msgs := make([]ApplyMsg, 0, r.commitIndex-r.lastApplied)
+		for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
+			msgs = append(msgs, ApplyMsg{Index: i, Term: r.log[i].Term, Command: r.log[i].Command})
+		}
+		r.lastApplied = r.commitIndex
+		r.mu.Unlock()
+
+		for _, m := range msgs {
+			select {
+			case r.applyCh <- m:
+			case <-r.stopCh:
+				return
+			}
+		}
+	}
+}
+
+// ---- Persistence ----
+
+type persistentState struct {
+	CurrentTerm int
+	VotedFor    int
+	Log         []LogEntry
+}
+
+// persistLocked durably saves the current state before returning. It is used for
+// term and vote changes and on followers, where the reply must not be sent
+// until the state is on disk.
+func (r *Raft) persistLocked() {
+	if r.killed() {
+		return
+	}
+	data, version := r.snapshotLocked()
+	r.save(data, version)
+}
+
+// flusher is the group-commit loop: each pass saves everything the leader has
+// appended so far in one write, while new appends queue up for the next pass.
+func (r *Raft) flusher() {
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-r.flushCh:
+		}
+		r.mu.Lock()
+		if r.killed() {
+			r.mu.Unlock()
+			return
+		}
+		data, version := r.snapshotLocked()
+		term, durable := r.currentTerm, r.lastIndex()
+		r.mu.Unlock()
+
+		r.save(data, version) // slow part, done without holding mu
+
+		r.mu.Lock()
+		// The log is never truncated during a leader's own term, so everything up
+		// to durable is now on disk and the leader may count itself for it.
+		if r.state == Leader && r.currentTerm == term && durable > r.matchIndex[r.id] {
+			r.matchIndex[r.id] = durable
+			r.advanceCommitLocked()
+		}
+		r.mu.Unlock()
+	}
+}
+
+func (r *Raft) snapshotLocked() ([]byte, uint64) {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(persistentState{r.currentTerm, r.votedFor, r.log}); err != nil {
+		panic(fmt.Sprintf("raft: encode state: %v", err))
+	}
+	r.stateVersion++
+	return buf.Bytes(), r.stateVersion
+}
+
+func (r *Raft) save(data []byte, version uint64) {
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	if version <= r.savedVersion {
+		return // a newer snapshot already reached disk
+	}
+	// Continuing without durable state could break safety, so failing to save is fatal.
+	if err := r.persister.Save(data); err != nil {
+		panic(fmt.Sprintf("raft: persist state: %v", err))
+	}
+	r.savedVersion = version
+}
+
+func (r *Raft) restore() error {
+	data, err := r.persister.Load()
+	if err != nil || len(data) == 0 {
+		return err
+	}
+	var st persistentState
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&st); err != nil {
+		return fmt.Errorf("raft: decode state: %w", err)
+	}
+	r.currentTerm, r.votedFor, r.log = st.CurrentTerm, st.VotedFor, st.Log
+	r.logf("restored term %d with %d log entries", r.currentTerm, r.lastIndex())
+	return nil
+}
+
+// ---- Helpers ----
+
+func (r *Raft) lastIndex() int { return len(r.log) - 1 }
+func (r *Raft) lastTerm() int  { return r.log[len(r.log)-1].Term }
+
+func (r *Raft) logf(format string, args ...any) {
+	if r.logger != nil {
+		r.logger.Printf(format, args...)
+	}
+}

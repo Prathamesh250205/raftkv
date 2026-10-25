@@ -98,6 +98,15 @@ Requires Go 1.22 or newer.
 go test ./...
 ```
 
+### One click: GitHub Codespaces (free, nothing to install)
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Prathamesh250205/raftkv)
+
+In the codespace terminal, run `./scripts/codespace-demo.sh`. It starts 3 nodes × 3 shards plus
+Prometheus and Grafana, and prints the API token and links. To share it, make ports **8001** (API)
+and **3000** (dashboard) public in the **Ports** tab. Reads and the dashboard are then open to
+anyone; writes still need the token.
+
 ### Docker: cluster, dashboard and chaos
 
 ```bash

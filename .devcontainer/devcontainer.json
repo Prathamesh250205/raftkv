@@ -1,9 +1,8 @@
 {
   "name": "raftkv",
-  "image": "mcr.microsoft.com/devcontainers/go:1.22",
-  "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
-  },
+  // GitHub's default Codespaces image: Docker and Go are preinstalled, and it
+  // is cached by Codespaces, so the codespace starts quickly.
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
   "hostRequirements": { "cpus": 2 },
   "forwardPorts": [8001, 3000],
   "portsAttributes": {

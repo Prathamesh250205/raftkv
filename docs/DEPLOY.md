@@ -15,7 +15,15 @@ Grafana dashboard are served from the internet; Raft traffic stays on the privat
 ```
 
 Time: about 45 minutes, most of it waiting for Docker builds. Cost: nothing, if you stay within
-the Always Free limits. Check Oracle's current Always Free terms before you start; they change.
+the [Always Free limits](https://docs.oracle.com/en-us/iaas/Content/FreeTier/resourceref.htm).
+As of October 2026 those are **2 Ampere (ARM) OCPUs and 12 GB of memory in total**, plus two
+small AMD Micro VMs, 200 GB of block storage and 10 TB of outbound traffic a month. The limits
+have been cut before, so check that page before you create anything.
+
+> **Idle VMs can be reclaimed.** Oracle may reclaim an Always Free VM that stays mostly idle
+> (under 20% CPU, network and, on ARM, memory, at the 95th percentile over 7 days). A demo
+> cluster is idle most of the time, so treat it as disposable: everything here can be rebuilt
+> with `setup.sh`.
 
 ## Security model
 
@@ -56,10 +64,20 @@ emails you right away.
 
 ## 3. Three VMs
 
-**Compute → Instances → Create instance**, three times, named `raftkv-1`, `raftkv-2`, `raftkv-3`:
+**Compute → Instances → Create instance**, three times. To stay inside the free allowance:
 
-- Image: **Ubuntu 24.04**
-- Shape: **VM.Standard.A1.Flex** (Ampere), 1 OCPU and 6 GB memory each
+| VM | Shape | Size | Role |
+|---|---|---|---|
+| `raftkv-1` | **VM.Standard.A1.Flex** (Ampere ARM) | 1 OCPU, 6 GB | node 1 + Prometheus + Grafana |
+| `raftkv-2` | **VM.Standard.A1.Flex** (Ampere ARM) | 1 OCPU, 6 GB | node 2 |
+| `raftkv-3` | **VM.Standard.E2.1.Micro** (AMD) | 1/8 OCPU, 1 GB | node 3 |
+
+Two ARM VMs use the whole 2-OCPU / 12 GB ARM allowance. **A third ARM VM would be billed.**
+The Micro VM is much slower, but Raft only needs a majority, so the cluster still commits at the
+speed of nodes 1 and 2. If you upgrade to a paid account, three equal VMs give fairer benchmarks.
+
+For each VM:
+- Image: **Ubuntu 24.04** (the ARM or x86 build is picked to match the shape)
 - Networking: the VCN and public subnet from step 2, with a public IPv4 address
 - SSH keys: upload your public key, or download the generated one
 

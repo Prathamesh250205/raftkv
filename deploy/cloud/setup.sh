@@ -41,6 +41,14 @@ if [ -z "${RAFTKV_AUTH_TOKEN:-}" ] || [ -z "${RAFTKV_CLUSTER_SECRET:-}" ]; then
 fi
 GRAFANA_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-$(openssl rand -hex 12)}
 
+# Small VMs (such as Oracle's 1 GB Micro shape) can run out of memory while
+# compiling the image; a swap file avoids that.
+if [ "$(awk '/MemTotal/ {print $2}' /proc/meminfo)" -lt 2000000 ] && [ ! -f /swapfile ]; then
+  echo "==> adding 2 GB of swap (low-memory VM)"
+  fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
 echo "==> installing Docker"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq

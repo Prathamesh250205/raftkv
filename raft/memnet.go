@@ -120,3 +120,7 @@ func (t *memNetTransport) AppendEntries(peer int, args *AppendEntriesArgs, reply
 func (t *memNetTransport) InstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
 	return t.net.deliver(t.from, peer, func(r *Raft) error { return r.HandleInstallSnapshot(args, reply) })
 }
+
+func (t *memNetTransport) TimeoutNow(peer int, args *TimeoutNowArgs, reply *TimeoutNowReply) error {
+	return t.net.deliver(t.from, peer, func(r *Raft) error { return r.HandleTimeoutNow(args, reply) })
+}

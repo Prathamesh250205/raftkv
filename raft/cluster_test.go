@@ -74,6 +74,14 @@ func (m *memTransport) InstallSnapshot(peer int, args *InstallSnapshotArgs, repl
 	return nil
 }
 
+func (m *memTransport) TimeoutNow(peer int, args *TimeoutNowArgs, reply *TimeoutNowReply) error {
+	node := m.c.link(m.from, peer)
+	if node == nil {
+		return errDropped
+	}
+	return node.HandleTimeoutNow(args, reply)
+}
+
 func newSnapshotCluster(t *testing.T, n, every int) *cluster {
 	c := newCluster(t, n)
 	c.mu.Lock()

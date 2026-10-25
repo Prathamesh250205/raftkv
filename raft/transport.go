@@ -17,6 +17,7 @@ type Transport interface {
 	RequestVote(peer int, args *RequestVoteArgs, reply *RequestVoteReply) error
 	AppendEntries(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) error
 	InstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) error
+	TimeoutNow(peer int, args *TimeoutNowArgs, reply *TimeoutNowReply) error
 }
 
 // RPCPath is where NewRPCHandler should be mounted. Raft traffic shares the
@@ -41,6 +42,10 @@ func (s *rpcService) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	return s.r.HandleInstallSnapshot(args, reply)
 }
 
+func (s *rpcService) TimeoutNow(args *TimeoutNowArgs, reply *TimeoutNowReply) error {
+	return s.r.HandleTimeoutNow(args, reply)
+}
+
 // NewRPCHandler serves r's RPC handlers over net/rpc (gob encoding, HTTP CONNECT).
 func NewRPCHandler(r *Raft) (http.Handler, error) {
 	srv := rpc.NewServer()
@@ -53,6 +58,7 @@ func NewRPCHandler(r *Raft) (http.Handler, error) {
 // HTTPTransport keeps one persistent RPC connection per peer and redials on failure.
 type HTTPTransport struct {
 	timeout time.Duration
+	path    string
 
 	mu      sync.Mutex
 	addrs   map[int]string
@@ -60,7 +66,13 @@ type HTTPTransport struct {
 }
 
 func NewHTTPTransport(addrs map[int]string) *HTTPTransport {
-	return &HTTPTransport{addrs: copyMembers(addrs), timeout: 200 * time.Millisecond, clients: map[int]*rpc.Client{}}
+	return NewHTTPTransportPath(addrs, RPCPath)
+}
+
+// NewHTTPTransportPath connects to peers' RPC handlers mounted at path, so
+// several Raft groups can share one HTTP port.
+func NewHTTPTransportPath(addrs map[int]string, path string) *HTTPTransport {
+	return &HTTPTransport{addrs: copyMembers(addrs), path: path, timeout: 200 * time.Millisecond, clients: map[int]*rpc.Client{}}
 }
 
 // UpdatePeers replaces the peer address book after a membership change.
@@ -89,6 +101,10 @@ func (t *HTTPTransport) InstallSnapshot(peer int, args *InstallSnapshotArgs, rep
 	return t.call(peer, "Raft.InstallSnapshot", args, reply, 5*time.Second) // snapshots can be large
 }
 
+func (t *HTTPTransport) TimeoutNow(peer int, args *TimeoutNowArgs, reply *TimeoutNowReply) error {
+	return t.call(peer, "Raft.TimeoutNow", args, reply)
+}
+
 func (t *HTTPTransport) call(peer int, method string, args, reply any, timeout ...time.Duration) error {
 	c, err := t.client(peer)
 	if err != nil {
@@ -101,7 +117,10 @@ func (t *HTTPTransport) call(peer int, method string, args, reply any, timeout .
 	call := c.Go(method, args, reply, make(chan *rpc.Call, 1))
 	select {
 	case <-call.Done:
-		if errors.Is(call.Error, rpc.ErrShutdown) || errors.Is(call.Error, io.ErrUnexpectedEOF) {
+		if call.Error != nil {
+			// Redial on any failure, not just broken connections: a connection
+			// can outlive the Raft instance it was attached to (e.g. a node
+			// restarted in-process) and would otherwise fail forever.
 			t.drop(peer, c)
 		}
 		return call.Error
@@ -128,7 +147,7 @@ func (t *HTTPTransport) client(peer int) (*rpc.Client, error) {
 		return nil, err
 	}
 	conn.SetDeadline(time.Now().Add(t.timeout))
-	io.WriteString(conn, "CONNECT "+RPCPath+" HTTP/1.0\n\n")
+	io.WriteString(conn, "CONNECT "+t.path+" HTTP/1.0\n\n")
 	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
 	if err != nil || resp.Status != connectedStatus {
 		conn.Close()

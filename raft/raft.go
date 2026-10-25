@@ -366,6 +366,9 @@ type RequestVoteArgs struct {
 	CandidateID  int
 	LastLogIndex int
 	LastLogTerm  int
+	// Transfer marks an election the leader asked for (TransferLeadership),
+	// which receivers honour even while they are hearing from that leader.
+	Transfer bool
 }
 
 type RequestVoteReply struct {
@@ -414,7 +417,7 @@ func (r *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	// leader, ignore candidates entirely, so a node removed from the cluster
 	// (which no longer gets heartbeats) can't depose the leader with ever
 	// higher terms.
-	if args.Term > r.currentTerm && r.hearingFromLeaderLocked() {
+	if args.Term > r.currentTerm && !args.Transfer && r.hearingFromLeaderLocked() {
 		reply.Term = r.currentTerm
 		return nil
 	}
@@ -582,7 +585,7 @@ func (r *Raft) ticker() {
 			}
 		} else if now.After(r.electionDeadline) {
 			if _, member := r.members[r.id]; member {
-				r.startElectionLocked()
+				r.startElectionLocked(false)
 			} else {
 				r.resetElectionTimerLocked() // joining or removed: never campaign
 			}
@@ -591,7 +594,7 @@ func (r *Raft) ticker() {
 	}
 }
 
-func (r *Raft) startElectionLocked() {
+func (r *Raft) startElectionLocked(transfer bool) {
 	r.state = Candidate
 	r.currentTerm++
 	r.votedFor = r.id
@@ -607,6 +610,7 @@ func (r *Raft) startElectionLocked() {
 		CandidateID:  r.id,
 		LastLogIndex: r.lastIndex(),
 		LastLogTerm:  r.lastTerm(),
+		Transfer:     transfer,
 	}
 	votes := 1
 	if votes > len(r.members)/2 {
@@ -980,6 +984,9 @@ func (r *Raft) save(state, snapshot []byte, version uint64) {
 	// Continuing without durable state could break safety, so failing to save is fatal.
 	start := time.Now()
 	if err := r.persister.Save(state, snapshot); err != nil {
+		if r.killed() {
+			return // shutting down; storage may already be closed
+		}
 		panic(fmt.Sprintf("raft: persist state: %v", err))
 	}
 	r.metrics.fsyncSeconds.Observe(time.Since(start).Seconds())

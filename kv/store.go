@@ -22,6 +22,7 @@ type Op string
 const (
 	OpGet    Op = "get"
 	OpPut    Op = "put"
+	OpAppend Op = "append"
 	OpDelete Op = "delete"
 )
 
@@ -262,6 +263,9 @@ func (s *Store) executeLocked(cmd Command) Result {
 	case OpPut:
 		s.data[cmd.Key] = cmd.Value
 		res = Result{Value: cmd.Value, Found: true}
+	case OpAppend:
+		s.data[cmd.Key] += cmd.Value
+		res = Result{Value: s.data[cmd.Key], Found: true}
 	case OpDelete:
 		_, res.Found = s.data[cmd.Key]
 		delete(s.data, cmd.Key)

@@ -16,6 +16,7 @@ const maxValueBytes = 1 << 20
 //
 //	GET    /kv/{key}   read a value (404 if missing)
 //	PUT    /kv/{key}   write the request body as the value
+//	POST   /kv/{key}/append   append the request body to the value
 //	DELETE /kv/{key}   remove a key
 //	GET    /status     this node's Raft state
 //
@@ -25,6 +26,7 @@ func RegisterRoutes(mux *http.ServeMux, s *Store, r *raft.Raft, addrs map[int]st
 	h := &handler{store: s, raft: r, addrs: addrs}
 	mux.HandleFunc("GET /kv/{key}", h.kv(OpGet))
 	mux.HandleFunc("PUT /kv/{key}", h.kv(OpPut))
+	mux.HandleFunc("POST /kv/{key}/append", h.kv(OpAppend))
 	mux.HandleFunc("DELETE /kv/{key}", h.kv(OpDelete))
 	mux.HandleFunc("GET /status", h.status)
 }
@@ -46,7 +48,7 @@ func (h *handler) kv(op Op) http.HandlerFunc {
 			}
 			cmd.Seq = n
 		}
-		if op == OpPut {
+		if op == OpPut || op == OpAppend {
 			body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxValueBytes))
 			if err != nil {
 				http.Error(w, "value too large", http.StatusRequestEntityTooLarge)

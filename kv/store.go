@@ -104,6 +104,17 @@ func NewStore(r *raft.Raft, applyCh <-chan raft.ApplyMsg, snapshotEvery int) *St
 	return s
 }
 
+// Keys returns every key currently stored, in no particular order.
+func (s *Store) Keys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0, len(s.data))
+	for k := range s.data {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // Get performs a linearizable read. It confirms leadership with ReadIndex,
 // waits until the local state has caught up to that index, and reads from
 // memory, so no log entry or fsync is needed.

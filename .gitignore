@@ -4,3 +4,4 @@ logs/
 *.exe
 *.test
 *.out
+logs-chaos-client.txt

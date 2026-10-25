@@ -75,7 +75,7 @@ func TestSharedLogCompacts(t *testing.T) {
 	l, _ := OpenSharedLog(dir)
 	big := bytes.Repeat([]byte("x"), 64<<10)
 	for i := 0; i < 400; i++ { // ~25 MB written, ~128 KB live
-		l.Persister(i % 2).Save(append([]byte(fmt.Sprint(i)), big...), nil)
+		l.Persister(i%2).Save(append([]byte(fmt.Sprint(i)), big...), nil)
 	}
 	l.Close()
 

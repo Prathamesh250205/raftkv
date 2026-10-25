@@ -16,8 +16,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"syscall"
 	"strconv"
 	"strings"
 
@@ -26,7 +28,8 @@ import (
 
 func main() {
 	id := flag.Int("id", 1, "this node's ID")
-	addr := flag.String("addr", "", "this node's host:port (default: its entry in -cluster)")
+	addr := flag.String("addr", "", "this node's host:port as other nodes reach it (default: its entry in -cluster)")
+	listen := flag.String("listen", "", "host:port to listen on, if different from -addr (e.g. 0.0.0.0:8000 in a container)")
 	cluster := flag.String("cluster", "1=127.0.0.1:8001", "founding nodes as id=host:port,...; ignored once a shard has data")
 	join := flag.Bool("join", false, "start empty and wait to be added to an existing cluster")
 	shards := flag.Int("shards", 1, "number of Raft groups to hash keys across (same on every node)")
@@ -67,6 +70,13 @@ func main() {
 	if cfg.DataDir == "" {
 		cfg.DataDir = fmt.Sprintf("data/node%d", *id)
 	}
+	if *listen != "" {
+		ln, err := net.Listen("tcp", *listen)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		cfg.Listener = ln
+	}
 
 	node, err := server.Start(cfg)
 	if err != nil {
@@ -75,7 +85,7 @@ func main() {
 	logger.Printf("listening on %s with %d shard(s), data in %s", cfg.Addr, cfg.Shards, cfg.DataDir)
 
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM) // SIGTERM: docker stop
 	<-sig
 	logger.Print("shutting down")
 	node.Close()

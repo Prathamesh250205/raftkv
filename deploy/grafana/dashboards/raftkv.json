@@ -1,0 +1,96 @@
+{
+  "uid": "raftkv",
+  "title": "raftkv",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": { "from": "now-10m", "to": "now" },
+  "panels": [
+    {
+      "type": "table",
+      "title": "Shard leaders",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max by (shard, node) (raft_is_leader) == 1", "instant": true, "format": "table" }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "Value": true }, "renameByName": { "shard": "Shard", "node": "Leader node" } } }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests per second by outcome",
+      "gridPos": { "h": 7, "w": 16, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        { "refId": "A", "expr": "sum by (op, result) (rate(kv_requests_total[10s])) > 0", "legendFormat": "{{op}} {{result}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Request latency p99",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.99, sum by (le, op) (rate(kv_request_seconds_bucket[30s])))", "legendFormat": "{{op}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Raft term per shard (steps = elections)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max by (shard) (raft_term)", "legendFormat": "shard {{shard}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "fsync latency p99 by node",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.99, sum by (le, node) (rate(raft_fsync_seconds_bucket[30s])))", "legendFormat": "node {{node}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Entries per AppendEntries (batching)",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (shard) (rate(raft_append_batch_entries_sum[30s])) / sum by (shard) (rate(raft_append_batch_entries_count[30s]))", "legendFormat": "shard {{shard}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Elections started per minute",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (node) (increase(raft_elections_started_total[1m]))", "legendFormat": "node {{node}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Commits per second per shard",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max by (shard) (rate(raft_commit_index[10s]))", "legendFormat": "shard {{shard}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Log entries held after compaction",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max by (shard) (raft_log_entries)", "legendFormat": "shard {{shard}}" }
+      ]
+    }
+  ]
+}

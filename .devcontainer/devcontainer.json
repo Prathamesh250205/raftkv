@@ -1,0 +1,14 @@
+{
+  "name": "raftkv",
+  "image": "mcr.microsoft.com/devcontainers/go:1.22",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "hostRequirements": { "cpus": 2 },
+  "forwardPorts": [8001, 3000],
+  "portsAttributes": {
+    "8001": { "label": "raftkv API (node 1)" },
+    "3000": { "label": "Grafana dashboard" }
+  },
+  "postAttachCommand": "echo 'Start the demo cluster: ./scripts/codespace-demo.sh'"
+}

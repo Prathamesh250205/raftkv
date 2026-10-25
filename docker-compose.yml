@@ -3,32 +3,42 @@
 #   open http://localhost:3000   (Grafana dashboard "raftkv")
 #   ./scripts/chaos.sh           (break things while a client writes)
 #
-# Nodes find each other by service name, so clients that follow redirects
-# should run inside the compose network, e.g.:
+# Nodes run with -forward, so any node answers any request: clients outside
+# the compose network can use http://localhost:8001 alone. Load test:
 #   docker compose run --rm client -addr node1:8000 -duration 10s
+#
+# Set RAFTKV_AUTH_TOKEN (for example in a .env file) before exposing the
+# cluster anywhere: writes then need it in the X-Api-Token header. Reads stay
+# public.
 
 x-node: &node
   build: .
   image: raftkv
   restart: unless-stopped
+  environment:
+    RAFTKV_AUTH_TOKEN: ${RAFTKV_AUTH_TOKEN:-}
+    RAFTKV_CLUSTER_SECRET: ${RAFTKV_CLUSTER_SECRET:-}
 
 services:
   node1:
     <<: *node
     command: [-id, "1", -addr, "node1:8000", -listen, "0.0.0.0:8000", -shards, "3",
-              -cluster, "1=node1:8000,2=node2:8000,3=node3:8000", -data, /data]
+              -cluster, "1=node1:8000,2=node2:8000,3=node3:8000",
+              -forward, -public-reads, -data, /data]
     volumes: [node1:/data]
     ports: ["8001:8000"]
   node2:
     <<: *node
     command: [-id, "2", -addr, "node2:8000", -listen, "0.0.0.0:8000", -shards, "3",
-              -cluster, "1=node1:8000,2=node2:8000,3=node3:8000", -data, /data]
+              -cluster, "1=node1:8000,2=node2:8000,3=node3:8000",
+              -forward, -public-reads, -data, /data]
     volumes: [node2:/data]
     ports: ["8002:8000"]
   node3:
     <<: *node
     command: [-id, "3", -addr, "node3:8000", -listen, "0.0.0.0:8000", -shards, "3",
-              -cluster, "1=node1:8000,2=node2:8000,3=node3:8000", -data, /data]
+              -cluster, "1=node1:8000,2=node2:8000,3=node3:8000",
+              -forward, -public-reads, -data, /data]
     volumes: [node3:/data]
     ports: ["8003:8000"]
 
@@ -37,6 +47,8 @@ services:
     image: raftkv
     entrypoint: [kvbench]
     profiles: [tools]
+    environment:
+      RAFTKV_AUTH_TOKEN: ${RAFTKV_AUTH_TOKEN:-}
 
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -52,6 +64,7 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/raftkv.json
     volumes:
       - "./deploy/grafana/provisioning:/etc/grafana/provisioning:ro"

@@ -179,11 +179,15 @@ func New(cfg Config) (*Raft, error) {
 	}
 	r.resetElectionTimerLocked()
 
+	// Fill replCh completely before starting any replicator: it is read
+	// without the lock, so it must not be written once goroutines run.
 	for _, p := range r.peers {
 		if p != r.id {
 			r.replCh[p] = make(chan struct{}, 1)
-			go r.replicator(p)
 		}
+	}
+	for p, ch := range r.replCh {
+		go r.replicator(p, ch)
 	}
 	go r.ticker()
 	go r.applier()
@@ -632,12 +636,12 @@ func signal(ch chan struct{}) {
 	}
 }
 
-func (r *Raft) replicator(peer int) {
+func (r *Raft) replicator(peer int, wake <-chan struct{}) {
 	for {
 		select {
 		case <-r.stopCh:
 			return
-		case <-r.replCh[peer]:
+		case <-wake:
 		}
 		r.replicateTo(peer)
 	}

@@ -1,6 +1,13 @@
 // Command kvnode runs one node of the replicated key-value store.
 //
+// Bootstrap a new cluster by giving every founding node the same -cluster:
+//
 //	kvnode -id 1 -cluster 1=127.0.0.1:8001,2=127.0.0.1:8002,3=127.0.0.1:8003
+//
+// Grow it later by starting a node with -join and adding it through the API:
+//
+//	kvnode -id 4 -addr 127.0.0.1:8004 -join
+//	curl -L -X POST -d '{"id":4,"addr":"127.0.0.1:8004"}' http://127.0.0.1:8001/cluster/members
 package main
 
 import (
@@ -11,7 +18,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -21,8 +27,10 @@ import (
 )
 
 func main() {
-	id := flag.Int("id", 1, "this node's ID (must appear in -cluster)")
-	cluster := flag.String("cluster", "1=127.0.0.1:8001", "comma-separated id=host:port for every node")
+	id := flag.Int("id", 1, "this node's ID")
+	addr := flag.String("addr", "", "this node's host:port (default: its entry in -cluster)")
+	cluster := flag.String("cluster", "1=127.0.0.1:8001", "founding members as id=host:port,...; ignored once the node has data")
+	join := flag.Bool("join", false, "start empty and wait to be added to an existing cluster")
 	dataDir := flag.String("data", "", "directory for durable state (default data/node<id>)")
 	snapshotEvery := flag.Int("snapshot-every", 1000, "compact the log after this many applied entries (0 disables)")
 	logReads := flag.Bool("log-reads", false, "serve reads through the Raft log instead of ReadIndex (for comparison)")
@@ -30,13 +38,18 @@ func main() {
 
 	logger := log.New(os.Stderr, fmt.Sprintf("[node %d] ", *id), log.Ltime|log.Lmicroseconds)
 
-	addrs, err := parseCluster(*cluster)
-	if err != nil {
-		logger.Fatal(err)
+	var peers map[int]string
+	if !*join {
+		var err error
+		if peers, err = parseCluster(*cluster); err != nil {
+			logger.Fatal(err)
+		}
 	}
-	self, ok := addrs[*id]
-	if !ok {
-		logger.Fatalf("id %d not found in -cluster %q", *id, *cluster)
+	self := *addr
+	if self == "" {
+		if self = peers[*id]; self == "" {
+			logger.Fatalf("no address for node %d: pass -addr, or list it in -cluster", *id)
+		}
 	}
 	if *dataDir == "" {
 		*dataDir = fmt.Sprintf("data/node%d", *id)
@@ -46,17 +59,12 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
-	peers := make([]int, 0, len(addrs))
-	for p := range addrs {
-		peers = append(peers, p)
-	}
-	sort.Ints(peers)
 
 	applyCh := make(chan raft.ApplyMsg, 256)
 	r, err := raft.New(raft.Config{
 		ID:        *id,
 		Peers:     peers,
-		Transport: raft.NewHTTPTransport(addrs),
+		Transport: raft.NewHTTPTransport(peers),
 		Persister: persister,
 		ApplyCh:   applyCh,
 		Logger:    logger,
@@ -77,7 +85,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle(raft.RPCPath, rpcHandler)
 	mux.Handle("GET /metrics", reg)
-	kv.RegisterRoutes(mux, store, r, addrs, reg)
+	kv.RegisterRoutes(mux, store, r, reg)
 
 	srv := &http.Server{Addr: self, Handler: mux}
 	go func() {

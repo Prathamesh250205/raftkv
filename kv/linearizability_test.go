@@ -53,9 +53,13 @@ func newTestCluster(t *testing.T, n int) *testCluster {
 }
 
 func (c *testCluster) start(id int) {
+	peers := map[int]string{}
+	for _, p := range c.ids {
+		peers[p] = fmt.Sprint(p)
+	}
 	applyCh := make(chan raft.ApplyMsg, 64)
 	r, err := raft.New(raft.Config{
-		ID: id, Peers: c.ids, Transport: c.net.Transport(id),
+		ID: id, Peers: peers, Transport: c.net.Transport(id),
 		Persister: c.persisters[id], ApplyCh: applyCh,
 	})
 	if err != nil {

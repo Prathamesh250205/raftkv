@@ -3,6 +3,7 @@ package raft
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -51,15 +52,29 @@ func NewRPCHandler(r *Raft) (http.Handler, error) {
 
 // HTTPTransport keeps one persistent RPC connection per peer and redials on failure.
 type HTTPTransport struct {
-	addrs   map[int]string
 	timeout time.Duration
 
 	mu      sync.Mutex
+	addrs   map[int]string
 	clients map[int]*rpc.Client
 }
 
 func NewHTTPTransport(addrs map[int]string) *HTTPTransport {
-	return &HTTPTransport{addrs: addrs, timeout: 200 * time.Millisecond, clients: map[int]*rpc.Client{}}
+	return &HTTPTransport{addrs: copyMembers(addrs), timeout: 200 * time.Millisecond, clients: map[int]*rpc.Client{}}
+}
+
+// UpdatePeers replaces the peer address book after a membership change.
+// Connections to peers that left or moved are closed.
+func (t *HTTPTransport) UpdatePeers(addrs map[int]string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id, c := range t.clients {
+		if addrs[id] != t.addrs[id] {
+			c.Close()
+			delete(t.clients, id)
+		}
+	}
+	t.addrs = copyMembers(addrs)
 }
 
 func (t *HTTPTransport) RequestVote(peer int, args *RequestVoteArgs, reply *RequestVoteReply) error {
@@ -99,12 +114,16 @@ func (t *HTTPTransport) call(peer int, method string, args, reply any, timeout .
 func (t *HTTPTransport) client(peer int) (*rpc.Client, error) {
 	t.mu.Lock()
 	c, ok := t.clients[peer]
+	addr, known := t.addrs[peer]
 	t.mu.Unlock()
 	if ok {
 		return c, nil
 	}
+	if !known {
+		return nil, fmt.Errorf("raft: no address for peer %d", peer)
+	}
 
-	conn, err := net.DialTimeout("tcp", t.addrs[peer], t.timeout)
+	conn, err := net.DialTimeout("tcp", addr, t.timeout)
 	if err != nil {
 		return nil, err
 	}

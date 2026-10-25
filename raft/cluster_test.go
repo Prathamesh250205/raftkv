@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ type cluster struct {
 	applied    []map[int][]byte // per node: log index -> command
 	lastIndex  []int
 	snapEvery  int // if > 0, each node snapshots after every snapEvery entries
+	founders   int // nodes 0..founders-1 bootstrap the cluster; the rest join later
 }
 
 var errDropped = errors.New("message dropped")
@@ -80,10 +82,15 @@ func newSnapshotCluster(t *testing.T, n, every int) *cluster {
 	return c
 }
 
-func newCluster(t *testing.T, n int) *cluster {
+func newCluster(t *testing.T, n int) *cluster { return newGrowingCluster(t, n, n) }
+
+// newGrowingCluster has room for n nodes but bootstraps only the first
+// founders; the others start empty and wait to be added with AddMember.
+func newGrowingCluster(t *testing.T, n, founders int) *cluster {
 	c := &cluster{
 		t:          t,
 		n:          n,
+		founders:   founders,
 		nodes:      make([]*Raft, n),
 		persisters: make([]*MemPersister, n),
 		connected:  make([]bool, n),
@@ -109,9 +116,12 @@ func (c *cluster) link(from, to int) *Raft {
 }
 
 func (c *cluster) start(i int) {
-	peers := make([]int, c.n)
-	for j := range peers {
-		peers[j] = j
+	var peers map[int]string
+	if i < c.founders {
+		peers = map[int]string{}
+		for j := 0; j < c.founders; j++ {
+			peers[j] = fmt.Sprintf("node-%d", j)
+		}
 	}
 	applyCh := make(chan ApplyMsg, 64)
 	r, err := New(Config{ID: i, Peers: peers, Transport: &memTransport{c, i}, Persister: c.persisters[i], ApplyCh: applyCh})

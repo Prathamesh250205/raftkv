@@ -51,13 +51,22 @@ func (s State) String() string {
 	return "unknown"
 }
 
-// LogEntry is one replicated command. A nil Command is a leader's no-op entry.
+type EntryKind uint8
+
+const (
+	EntryNormal EntryKind = iota // a service command; nil Command is a leader's no-op
+	EntryConfig                  // a cluster membership change (see membership.go)
+)
+
+// LogEntry is one replicated command or membership change.
 type LogEntry struct {
 	Term    int
+	Kind    EntryKind
 	Command []byte
 }
 
 // ApplyMsg is delivered on ApplyCh, in log order, once an entry is committed.
+// Membership changes are delivered with a nil Command, like no-ops.
 // When SnapshotValid is set it carries a snapshot instead: the service must
 // replace its whole state with Snapshot, which covers every entry up to Index.
 type ApplyMsg struct {
@@ -70,8 +79,12 @@ type ApplyMsg struct {
 }
 
 type Config struct {
-	ID        int
-	Peers     []int // IDs of every node in the cluster, including ID
+	ID int
+	// Peers bootstraps a brand-new cluster: every member's ID and address,
+	// including this node. It is ignored once the node has persisted state.
+	// Leave it empty for a node that will join an existing cluster through
+	// AddMember; such a node waits until a leader contacts it.
+	Peers     map[int]string
 	Transport Transport
 	Persister Persister
 	ApplyCh   chan<- ApplyMsg
@@ -87,6 +100,8 @@ type Status struct {
 	LastApplied   int    `json:"last_applied"`
 	LastLogIndex  int    `json:"last_log_index"`
 	SnapshotIndex int    `json:"snapshot_index"`
+	// Members is the cluster configuration this node is using: ID -> address.
+	Members map[int]string `json:"members"`
 }
 
 type Raft struct {
@@ -94,7 +109,6 @@ type Raft struct {
 	applyCond *sync.Cond
 
 	id        int
-	peers     []int
 	transport Transport
 	persister Persister
 	applyCh   chan<- ApplyMsg
@@ -109,6 +123,14 @@ type Raft struct {
 	snapIndex   int
 	snapshot    []byte // the service's state as of snapIndex
 
+	// Cluster membership (thesis §4.1). members is the latest configuration in
+	// the log, used as soon as it is appended; configIndex is that entry's index
+	// (or snapIndex when it came from the snapshot). baseMembers is the
+	// configuration as of snapIndex, persisted alongside the snapshot.
+	members     map[int]string
+	configIndex int
+	baseMembers map[int]string
+
 	// Volatile state.
 	state           State
 	leaderID        int
@@ -120,8 +142,9 @@ type Raft struct {
 	nextIndex  map[int]int
 	matchIndex map[int]int
 
-	electionDeadline time.Time
-	lastBroadcast    time.Time
+	electionDeadline  time.Time
+	lastBroadcast     time.Time
+	lastLeaderContact time.Time
 
 	// Group commit. The leader appends to its in-memory log and lets the flusher
 	// fsync everything appended since the last flush in one write. stateVersion
@@ -132,8 +155,10 @@ type Raft struct {
 	savedVersion uint64     // guarded by persistMu
 
 	// One replicator goroutine per peer keeps a single AppendEntries in flight;
-	// entries appended meanwhile ride along in the next batch.
-	replCh map[int]chan struct{}
+	// entries appended meanwhile ride along in the next batch. Replicators come
+	// and go with membership changes; replStop ends one.
+	replCh   map[int]chan struct{}
+	replStop map[int]chan struct{}
 
 	// ReadIndex (§8). Every AppendEntries carries the heartbeat round it was
 	// sent in; a reply in our term proves the peer still saw us as leader then.
@@ -148,19 +173,14 @@ type Raft struct {
 }
 
 func New(cfg Config) (*Raft, error) {
-	found := false
-	for _, p := range cfg.Peers {
-		if p == cfg.ID {
-			found = true
+	if len(cfg.Peers) > 0 {
+		if _, ok := cfg.Peers[cfg.ID]; !ok {
+			return nil, fmt.Errorf("raft: node %d is not in its own bootstrap peers", cfg.ID)
 		}
-	}
-	if !found {
-		return nil, fmt.Errorf("raft: node %d is not in peers %v", cfg.ID, cfg.Peers)
 	}
 
 	r := &Raft{
 		id:         cfg.ID,
-		peers:      append([]int(nil), cfg.Peers...),
 		transport:  cfg.Transport,
 		persister:  cfg.Persister,
 		applyCh:    cfg.ApplyCh,
@@ -172,6 +192,7 @@ func New(cfg Config) (*Raft, error) {
 		matchIndex: map[int]int{},
 		flushCh:    make(chan struct{}, 1),
 		replCh:     map[int]chan struct{}{},
+		replStop:   map[int]chan struct{}{},
 		peerAck:    map[int]uint64{},
 		stopCh:     make(chan struct{}),
 	}
@@ -180,18 +201,14 @@ func New(cfg Config) (*Raft, error) {
 	if err := r.restore(); err != nil {
 		return nil, err
 	}
+	if len(r.baseMembers) == 0 && len(cfg.Peers) > 0 {
+		r.baseMembers = copyMembers(cfg.Peers) // fresh cluster (or state from before membership existed)
+	}
 	r.resetElectionTimerLocked()
 
-	// Fill replCh completely before starting any replicator: it is read
-	// without the lock, so it must not be written once goroutines run.
-	for _, p := range r.peers {
-		if p != r.id {
-			r.replCh[p] = make(chan struct{}, 1)
-		}
-	}
-	for p, ch := range r.replCh {
-		go r.replicator(p, ch)
-	}
+	r.mu.Lock()
+	r.recomputeMembersLocked() // also starts a replicator per peer
+	r.mu.Unlock()
 	go r.ticker()
 	go r.applier()
 	go r.flusher()
@@ -224,6 +241,10 @@ func (r *Raft) Snapshot(index int, data []byte) {
 	if index <= r.snapIndex || index > r.commitIndex || r.killed() {
 		return
 	}
+	r.baseMembers = r.membersAtLocked(index) // must be read before the log is trimmed
+	if r.configIndex < index {
+		r.configIndex = index
+	}
 	r.log = append([]LogEntry{{Term: r.termAt(index)}}, r.log[index-r.snapIndex+1:]...)
 	r.snapIndex = index
 	r.snapshot = data
@@ -254,7 +275,7 @@ func (r *Raft) ReadIndex(timeout time.Duration) (int, error) {
 		return 0, ErrLeaderNotReady
 	}
 	readIndex := r.commitIndex
-	if len(r.peers) == 1 {
+	if _, ok := r.members[r.id]; ok && len(r.members) == 1 {
 		r.mu.Unlock()
 		return readIndex, nil
 	}
@@ -287,13 +308,13 @@ func (r *Raft) ackLocked(peer int, round uint64) {
 	r.peerAck[peer] = round
 	for len(r.readWaiters) > 0 {
 		w := r.readWaiters[0]
-		acks := 1 // ourselves
-		for _, p := range r.peers {
-			if p != r.id && r.peerAck[p] >= w.round {
+		acks := 0
+		for p := range r.members {
+			if p == r.id || r.peerAck[p] >= w.round {
 				acks++
 			}
 		}
-		if acks <= len(r.peers)/2 {
+		if acks <= len(r.members)/2 {
 			return // later waiters need even newer rounds
 		}
 		w.done <- nil
@@ -320,6 +341,7 @@ func (r *Raft) Status() Status {
 		LastApplied:   r.lastApplied,
 		LastLogIndex:  r.lastIndex(),
 		SnapshotIndex: r.snapIndex,
+		Members:       copyMembers(r.members),
 	}
 }
 
@@ -374,6 +396,7 @@ type InstallSnapshotArgs struct {
 	LeaderID          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
+	Members           map[int]string // configuration as of LastIncludedIndex
 	Data              []byte
 }
 
@@ -386,6 +409,14 @@ func (r *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	defer r.mu.Unlock()
 	if r.killed() {
 		return ErrStopped
+	}
+	// Disruptive servers (thesis §4.2.3): while we are hearing from a live
+	// leader, ignore candidates entirely, so a node removed from the cluster
+	// (which no longer gets heartbeats) can't depose the leader with ever
+	// higher terms.
+	if args.Term > r.currentTerm && r.hearingFromLeaderLocked() {
+		reply.Term = r.currentTerm
+		return nil
 	}
 	if args.Term > r.currentTerm {
 		r.stepDownLocked(args.Term)
@@ -460,6 +491,7 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		break
 	}
 	if changed {
+		r.recomputeMembersLocked() // entries may add or truncate a config change
 		r.persistLocked()
 	}
 
@@ -495,9 +527,11 @@ func (r *Raft) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	}
 	r.snapIndex = lii
 	r.snapshot = args.Data
+	r.baseMembers = copyMembers(args.Members)
 	r.commitIndex = lii
 	r.lastApplied = lii
 	r.pendingSnapshot = true
+	r.recomputeMembersLocked()
 	r.persistSnapshotLocked()
 	r.metrics.snapshotsInstalled.Inc()
 	r.applyCond.Broadcast()
@@ -517,8 +551,16 @@ func (r *Raft) acceptLeaderLocked(term, leader int) bool {
 		r.state = Follower // someone else won this term
 	}
 	r.leaderID = leader
+	r.lastLeaderContact = time.Now()
 	r.resetElectionTimerLocked()
 	return true
+}
+
+func (r *Raft) hearingFromLeaderLocked() bool {
+	if r.state == Leader {
+		return true
+	}
+	return r.leaderID != -1 && time.Since(r.lastLeaderContact) < ElectionTimeoutMin
 }
 
 // ---- Elections ----
@@ -539,7 +581,11 @@ func (r *Raft) ticker() {
 				r.broadcastLocked()
 			}
 		} else if now.After(r.electionDeadline) {
-			r.startElectionLocked()
+			if _, member := r.members[r.id]; member {
+				r.startElectionLocked()
+			} else {
+				r.resetElectionTimerLocked() // joining or removed: never campaign
+			}
 		}
 		r.mu.Unlock()
 	}
@@ -563,11 +609,11 @@ func (r *Raft) startElectionLocked() {
 		LastLogTerm:  r.lastTerm(),
 	}
 	votes := 1
-	if votes > len(r.peers)/2 {
+	if votes > len(r.members)/2 {
 		r.becomeLeaderLocked()
 		return
 	}
-	for _, p := range r.peers {
+	for p := range r.members {
 		if p == r.id {
 			continue
 		}
@@ -585,8 +631,11 @@ func (r *Raft) startElectionLocked() {
 			if r.state != Candidate || r.currentTerm != term || !reply.VoteGranted {
 				return
 			}
+			if _, member := r.members[p]; !member {
+				return // the configuration changed under us
+			}
 			votes++
-			if votes > len(r.peers)/2 {
+			if votes > len(r.members)/2 {
 				r.becomeLeaderLocked()
 			}
 		}(p)
@@ -602,7 +651,8 @@ func (r *Raft) becomeLeaderLocked() {
 	// A no-op entry from the new term lets entries from earlier terms commit (§5.4.2, §8).
 	r.log = append(r.log, LogEntry{Term: r.currentTerm})
 	r.persistLocked()
-	for _, p := range r.peers {
+	r.nextIndex, r.matchIndex = map[int]int{}, map[int]int{}
+	for p := range r.members {
 		r.nextIndex[p] = r.lastIndex()
 		r.matchIndex[p] = 0
 	}
@@ -650,11 +700,13 @@ func signal(ch chan struct{}) {
 	}
 }
 
-func (r *Raft) replicator(peer int, wake <-chan struct{}) {
+func (r *Raft) replicator(peer int, wake, stop <-chan struct{}) {
 	for {
 		select {
 		case <-r.stopCh:
 			return
+		case <-stop:
+			return // peer left the cluster
 		case <-wake:
 		}
 		r.replicateTo(peer)
@@ -724,7 +776,9 @@ func (r *Raft) replicateTo(peer int) {
 	}
 	next = max(next, r.matchIndex[peer]+1, 1)
 	r.nextIndex[peer] = min(next, r.lastIndex()+1)
-	signal(r.replCh[peer])
+	if ch, ok := r.replCh[peer]; ok {
+		signal(ch)
+	}
 }
 
 // sendSnapshot is called with mu held and releases it.
@@ -735,6 +789,7 @@ func (r *Raft) sendSnapshot(peer int) {
 		LeaderID:          r.id,
 		LastIncludedIndex: r.snapIndex,
 		LastIncludedTerm:  r.termAt(r.snapIndex),
+		Members:           copyMembers(r.baseMembers),
 		Data:              r.snapshot,
 	}
 	r.mu.Unlock()
@@ -765,26 +820,35 @@ func (r *Raft) recordMatchLocked(peer, match int) {
 		r.nextIndex[peer] = match + 1
 	}
 	r.advanceCommitLocked()
-	if r.nextIndex[peer] <= r.lastIndex() {
-		signal(r.replCh[peer]) // more batches to send
+	if ch, ok := r.replCh[peer]; ok && r.nextIndex[peer] <= r.lastIndex() {
+		signal(ch) // more batches to send
 	}
 }
 
-// advanceCommitLocked commits the highest index replicated on a majority.
-// Only entries from the current term are committed by counting replicas (§5.4.2).
+// advanceCommitLocked commits the highest index replicated on a majority of the
+// current configuration. Only entries from the current term are committed by
+// counting replicas (§5.4.2).
 func (r *Raft) advanceCommitLocked() {
 	for n := r.lastIndex(); n > r.commitIndex && r.termAt(n) == r.currentTerm; n-- {
 		count := 0
-		for _, p := range r.peers {
+		for p := range r.members {
 			if r.matchIndex[p] >= n {
 				count++
 			}
 		}
-		if count > len(r.peers)/2 {
+		if count > len(r.members)/2 {
 			r.commitIndex = n
 			r.applyCond.Broadcast()
-			return
+			break
 		}
+	}
+	// A leader that removed itself keeps leading until that change commits,
+	// then steps down (thesis §4.2.2).
+	if _, member := r.members[r.id]; !member && r.state == Leader && r.commitIndex >= r.configIndex {
+		r.logf("removed from the cluster; stepping down")
+		r.state = Follower
+		r.leaderID = -1
+		r.failReadsLocked()
 	}
 }
 
@@ -812,7 +876,11 @@ func (r *Raft) applier() {
 			// lastApplied >= snapIndex always holds, so these entries are all in the log.
 			for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
 				e := r.entry(i)
-				msgs = append(msgs, ApplyMsg{Index: i, Term: e.Term, Command: e.Command})
+				m := ApplyMsg{Index: i, Term: e.Term, Command: e.Command}
+				if e.Kind == EntryConfig {
+					m.Command = nil // the service sees membership changes as no-ops
+				}
+				msgs = append(msgs, m)
 			}
 			r.lastApplied = r.commitIndex
 		}
@@ -834,15 +902,17 @@ type persistentState struct {
 	CurrentTerm int
 	VotedFor    int
 	SnapIndex   int
+	BaseMembers map[int]string // configuration as of SnapIndex
 	Log         []LogEntry
 }
 
 // snapshotFile is what reaches disk for a snapshot. Its index and term let
 // restore reconcile a crash between writing the snapshot and the state.
 type snapshotFile struct {
-	Index int
-	Term  int
-	Data  []byte
+	Index   int
+	Term    int
+	Members map[int]string
+	Data    []byte
 }
 
 // persistLocked durably saves the current state before returning. It is used for
@@ -862,7 +932,7 @@ func (r *Raft) persistSnapshotLocked() {
 		return
 	}
 	data, version := r.encodeLocked()
-	r.save(data, encode(snapshotFile{r.snapIndex, r.termAt(r.snapIndex), r.snapshot}), version)
+	r.save(data, encode(snapshotFile{r.snapIndex, r.termAt(r.snapIndex), r.baseMembers, r.snapshot}), version)
 }
 
 // flusher is the group-commit loop: each pass saves everything the leader has
@@ -898,7 +968,7 @@ func (r *Raft) flusher() {
 
 func (r *Raft) encodeLocked() ([]byte, uint64) {
 	r.stateVersion++
-	return encode(persistentState{r.currentTerm, r.votedFor, r.snapIndex, r.log}), r.stateVersion
+	return encode(persistentState{r.currentTerm, r.votedFor, r.snapIndex, r.baseMembers, r.log}), r.stateVersion
 }
 
 func (r *Raft) save(state, snapshot []byte, version uint64) {
@@ -927,6 +997,7 @@ func (r *Raft) restore() error {
 			return fmt.Errorf("raft: decode state: %w", err)
 		}
 		r.currentTerm, r.votedFor, r.snapIndex, r.log = st.CurrentTerm, st.VotedFor, st.SnapIndex, st.Log
+		r.baseMembers = st.BaseMembers
 	}
 	if len(snapData) > 0 {
 		var snap snapshotFile
@@ -941,6 +1012,7 @@ func (r *Raft) restore() error {
 				r.log = []LogEntry{{Term: snap.Term}}
 			}
 			r.snapIndex = snap.Index
+			r.baseMembers = snap.Members
 		}
 		r.snapshot = snap.Data
 		r.commitIndex, r.lastApplied = r.snapIndex, r.snapIndex

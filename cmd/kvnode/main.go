@@ -19,9 +19,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"syscall"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"raftkv/server"
 )

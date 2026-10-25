@@ -10,6 +10,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# SSH sessions into a codespace don't export CODESPACE_NAME; this file has it.
+vars=/workspaces/.codespaces/shared/environment-variables.json
+if [ -z "${CODESPACE_NAME:-}" ] && [ -f "$vars" ]; then
+  CODESPACE_NAME=$(sed -n 's/.*"CODESPACE_NAME": *"\([^"]*\)".*/\1/p' "$vars")
+fi
+
 if [ -n "${CODESPACE_NAME:-}" ]; then
   domain=${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}
   api="https://${CODESPACE_NAME}-8001.${domain}"
@@ -30,6 +36,10 @@ fi
 set -a
 . ./.env
 set +a
+if [ "${GRAFANA_ROOT_URL:-}" != "$grafana" ]; then # e.g. .env written outside the codespace
+  sed -i "s|^GRAFANA_ROOT_URL=.*|GRAFANA_ROOT_URL=$grafana|" .env
+  GRAFANA_ROOT_URL=$grafana
+fi
 
 docker compose up -d --build node1 node2 node3 prometheus grafana
 

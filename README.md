@@ -118,6 +118,10 @@ Open **http://localhost:3000** to watch leaders move, terms step up and latency 
 
 ### Windows, without Docker
 
+**Guided demo:** `.\scripts\demo.ps1` starts a cluster, writes data, kills a shard leader, shows
+the failover and that nothing was lost, restarts the node and benchmarks it, pausing before each
+step. Add `-Auto` to run it straight through.
+
 ```powershell
 .\scripts\cluster.ps1 -Shards 3      # builds and starts 3 nodes on ports 8001-8003
 .\bin\kvctl.exe status

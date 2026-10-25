@@ -1,0 +1,10 @@
+# Node 1: the API plus the read-only Grafana dashboard on its own subdomain.
+{$PUBLIC_HOST} {
+	encode gzip
+	reverse_proxy kvnode:8000
+}
+
+grafana.{$PUBLIC_HOST} {
+	encode gzip
+	reverse_proxy grafana:3000
+}

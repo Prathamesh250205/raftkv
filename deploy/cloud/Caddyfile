@@ -1,0 +1,5 @@
+# Caddy obtains and renews the HTTPS certificate automatically.
+{$PUBLIC_HOST} {
+	encode gzip
+	reverse_proxy kvnode:8000
+}

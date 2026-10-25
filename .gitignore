@@ -5,3 +5,5 @@ logs/
 *.test
 *.out
 logs-chaos-client.txt
+deploy/cloud/.env
+deploy/cloud/prometheus.yml

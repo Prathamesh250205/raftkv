@@ -1,0 +1,60 @@
+# One raftkv node on a cloud VM, behind Caddy for HTTPS. setup.sh writes the
+# .env this file reads; node 1 also runs Prometheus and Grafana.
+#
+#   docker compose up -d --build                        # nodes 2 and 3
+#   docker compose --profile monitoring up -d --build   # node 1
+#
+# Exposure:
+#   443/80  public  Caddy -> kvnode API (writes need the API token)
+#   8000    private kvnode, bound to the VM's private IP only. Raft RPCs and
+#                   forwarded requests use it; peers also need the cluster secret.
+
+services:
+  kvnode:
+    build: ../..
+    image: raftkv
+    restart: unless-stopped
+    environment:
+      RAFTKV_AUTH_TOKEN: ${RAFTKV_AUTH_TOKEN:?}
+      RAFTKV_CLUSTER_SECRET: ${RAFTKV_CLUSTER_SECRET:?}
+    command: [-id, "${NODE_ID}", -addr, "${PRIVATE_IP}:8000", -listen, "0.0.0.0:8000",
+              -shards, "${SHARDS}", -cluster, "${CLUSTER}", -forward, -public-reads, -data, /data]
+    volumes: [data:/data]
+    # Docker publishes ports past the host firewall, so binding to the private
+    # IP is what keeps this port off the internet.
+    ports: ["${PRIVATE_IP}:8000:8000"]
+
+  caddy:
+    image: caddy:2.8
+    restart: unless-stopped
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST}
+    volumes:
+      - ./${CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+    ports: ["80:80", "443:443"]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    restart: unless-stopped
+    profiles: [monitoring]
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    restart: unless-stopped
+    profiles: [monitoring]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: https://grafana.${PUBLIC_HOST}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/raftkv.json
+    volumes:
+      - "../grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "../grafana/dashboards:/var/lib/grafana/dashboards:ro"
+
+volumes:
+  data:
+  caddy:

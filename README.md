@@ -155,12 +155,30 @@ SHARD  LEADER   MEMBERS
 | `GET/POST /shards/{g}/members`, `DELETE /shards/{g}/members/{id}` | Shard membership |
 | `GET /metrics` | Prometheus metrics |
 
-Requests that reach the wrong node get `307` plus an `X-Raft-Leader` header. `503` with
-`Retry-After` means "no leader right now, retry".
+Requests that reach the wrong node get `307` plus an `X-Raft-Leader` header, or are relayed to
+the leader when nodes run with `-forward`. `503` with `Retry-After` means "no leader right now,
+retry".
+
+## Security and deployment
+
+| Flag | Effect |
+|---|---|
+| `-auth-token` (or `$RAFTKV_AUTH_TOKEN`) | Writes and membership changes need it in the `X-Api-Token` header |
+| `-public-reads` | With a token, reads stay open to anyone |
+| `-cluster-secret` (or `$RAFTKV_CLUSTER_SECRET`) | Peers must present it to open Raft RPC connections |
+| `-forward` | Relay requests to the shard leader instead of redirecting; for nodes on private IPs |
+
+Tokens are compared in constant time. A custom header is used instead of `Authorization`,
+because HTTP clients drop `Authorization` when a redirect goes to another host.
+
+**[docs/DEPLOY.md](docs/DEPLOY.md)** walks through running the cluster on three Oracle Cloud
+free-tier VMs. Caddy provides HTTPS with automatic certificates, Raft stays on the private
+network, and Grafana is public but read-only. Setup is one command per VM
+([`deploy/cloud/setup.sh`](deploy/cloud/setup.sh)).
 
 ## Testing
 
-37 tests across four packages. Raft tests run whole clusters over an in-memory network that can
+41 tests across four packages. Raft tests run whole clusters over an in-memory network that can
 drop, delay and partition messages, crash nodes and restart them from their saved state. On every
 applied entry, the harness asserts that **no two nodes ever apply different commands at the same
 index**.
@@ -176,6 +194,7 @@ index**.
 | Leadership transfer | Hand-off; refusal when the target is behind |
 | Shared WAL | Round trip; **torn-tail recovery**; compaction; concurrent batching |
 | Sharded cluster (real HTTP) | End-to-end routing; leader balancing; failover and restart from disk; moving a shard to a new node, which then routes requests for shards it doesn't host |
+| Security | Token required for writes and membership; private reads; **RPCs without the cluster secret are refused**; forward mode answers without redirects |
 | **Linearizability** | 5 nodes, 6 clients, 8 s of gets/puts/appends while a nemesis partitions, crashes and restarts nodes with 2% packet loss. The history (2,500–6,000 ops per run) is checked with Porcupine |
 
 The linearizability test has already caught one real bug: a concurrent map access when starting
@@ -253,7 +272,8 @@ multi-machine gains weren't measured here.
 - [ ] **Shard splitting**: the shard count is fixed when the cluster is created; shards can move
       between nodes but not split.
 - [ ] Per-entry WAL records, and a client library with a cached shard map.
-- [ ] A benchmark on multiple machines.
+- [ ] A benchmark on multiple machines (the deployment guide sets this up).
+- [ ] TLS for Raft RPCs. Today they rely on a private network plus the cluster secret.
 
 ## References
 

@@ -24,6 +24,7 @@ func main() {
 	cluster := flag.String("cluster", "1=127.0.0.1:8001", "comma-separated id=host:port for every node")
 	dataDir := flag.String("data", "", "directory for durable state (default data/node<id>)")
 	snapshotEvery := flag.Int("snapshot-every", 1000, "compact the log after this many applied entries (0 disables)")
+	logReads := flag.Bool("log-reads", false, "serve reads through the Raft log instead of ReadIndex (for comparison)")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, fmt.Sprintf("[node %d] ", *id), log.Ltime|log.Lmicroseconds)
@@ -63,6 +64,7 @@ func main() {
 		logger.Fatal(err)
 	}
 	store := kv.NewStore(r, applyCh, *snapshotEvery)
+	store.LogReads = *logReads
 
 	rpcHandler, err := raft.NewRPCHandler(r)
 	if err != nil {

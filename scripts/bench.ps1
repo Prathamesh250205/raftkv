@@ -2,7 +2,9 @@
 # against the leader, then stops the cluster.
 #   .\scripts\bench.ps1                          # uses bin\kvnode.exe
 #   .\scripts\bench.ps1 -Binary bin\old.exe -Duration 10s -Workers 64
-param([string]$Binary = "bin\kvnode.exe", [string]$Duration = "10s", [int]$Workers = 32)
+#   .\scripts\bench.ps1 -Op get -NodeArgs "-log-reads"
+param([string]$Binary = "bin\kvnode.exe", [string]$Duration = "10s", [int]$Workers = 32,
+      [string]$Op = "put", [string]$NodeArgs = "")
 
 $root = Split-Path -Parent $PSScriptRoot
 $bin = Join-Path $root $Binary
@@ -14,7 +16,7 @@ New-Item -ItemType Directory -Force "$root\logs" | Out-Null
 
 foreach ($i in 1..3) {
     Start-Process -FilePath $bin `
-        -ArgumentList "-id $i -cluster $cluster -data `"$root\data\bench\node$i`"" `
+        -ArgumentList "-id $i -cluster $cluster $NodeArgs -data `"$root\data\bench\node$i`"" `
         -RedirectStandardError "$root\logs\bench-node$i.log" -WindowStyle Hidden | Out-Null
 }
 
@@ -32,7 +34,7 @@ foreach ($try in 1..50) {
 if (-not $leader) { Write-Host "no leader elected"; return }
 
 Push-Location $root
-go run ./cmd/kvbench -addr $leader -workers $Workers -duration $Duration
+go run ./cmd/kvbench -addr $leader -workers $Workers -duration $Duration -op $Op
 Pop-Location
 
 Get-Process kvnode* -ErrorAction SilentlyContinue | Stop-Process

@@ -24,7 +24,12 @@ const (
 	maxEntriesPerRPC = 512
 )
 
-var ErrStopped = errors.New("raft: node stopped")
+var (
+	ErrStopped        = errors.New("raft: node stopped")
+	ErrNotLeader      = errors.New("raft: not the leader")
+	ErrLeaderNotReady = errors.New("raft: leader has not committed an entry in its term yet")
+	ErrReadTimeout    = errors.New("raft: could not confirm leadership in time")
+)
 
 type State int
 
@@ -130,6 +135,12 @@ type Raft struct {
 	// entries appended meanwhile ride along in the next batch.
 	replCh map[int]chan struct{}
 
+	// ReadIndex (§8). Every AppendEntries carries the heartbeat round it was
+	// sent in; a reply in our term proves the peer still saw us as leader then.
+	hbRound     uint64
+	peerAck     map[int]uint64 // latest round each peer has acknowledged
+	readWaiters []readWaiter   // ordered by round
+
 	dead   atomic.Bool
 	stopCh chan struct{}
 }
@@ -159,6 +170,7 @@ func New(cfg Config) (*Raft, error) {
 		matchIndex: map[int]int{},
 		flushCh:    make(chan struct{}, 1),
 		replCh:     map[int]chan struct{}{},
+		peerAck:    map[int]uint64{},
 		stopCh:     make(chan struct{}),
 	}
 	r.applyCond = sync.NewCond(&r.mu)
@@ -209,6 +221,76 @@ func (r *Raft) Snapshot(index int, data []byte) {
 	r.snapshot = data
 	r.persistSnapshotLocked()
 	r.logf("snapshot at index %d, %d entries left in log", index, len(r.log)-1)
+}
+
+type readWaiter struct {
+	round uint64
+	done  chan error
+}
+
+// ReadIndex returns a log index such that once the service has applied it,
+// serving a read from local state is linearizable (§8). It confirms this node
+// is still leader by collecting heartbeat acknowledgements from a majority,
+// which costs one round trip and no disk write.
+func (r *Raft) ReadIndex(timeout time.Duration) (int, error) {
+	r.mu.Lock()
+	if r.state != Leader || r.killed() {
+		r.mu.Unlock()
+		return 0, ErrNotLeader
+	}
+	// Until it commits an entry of its own term, a new leader doesn't know how
+	// far the commit index really extends.
+	if r.termAt(r.commitIndex) != r.currentTerm {
+		r.mu.Unlock()
+		return 0, ErrLeaderNotReady
+	}
+	readIndex := r.commitIndex
+	if len(r.peers) == 1 {
+		r.mu.Unlock()
+		return readIndex, nil
+	}
+	r.hbRound++
+	w := readWaiter{round: r.hbRound, done: make(chan error, 1)}
+	r.readWaiters = append(r.readWaiters, w)
+	r.broadcastLocked()
+	r.mu.Unlock()
+
+	select {
+	case err := <-w.done:
+		return readIndex, err
+	case <-time.After(timeout):
+		return 0, ErrReadTimeout
+	}
+}
+
+// ackLocked records that peer acknowledged our leadership in round, and
+// releases every read that a majority has now confirmed.
+func (r *Raft) ackLocked(peer int, round uint64) {
+	if round <= r.peerAck[peer] {
+		return
+	}
+	r.peerAck[peer] = round
+	for len(r.readWaiters) > 0 {
+		w := r.readWaiters[0]
+		acks := 1 // ourselves
+		for _, p := range r.peers {
+			if p != r.id && r.peerAck[p] >= w.round {
+				acks++
+			}
+		}
+		if acks <= len(r.peers)/2 {
+			return // later waiters need even newer rounds
+		}
+		w.done <- nil
+		r.readWaiters = r.readWaiters[1:]
+	}
+}
+
+func (r *Raft) failReadsLocked() {
+	for _, w := range r.readWaiters {
+		w.done <- ErrNotLeader
+	}
+	r.readWaiters = nil
 }
 
 func (r *Raft) Status() Status {
@@ -506,6 +588,7 @@ func (r *Raft) becomeLeaderLocked() {
 		r.nextIndex[p] = r.lastIndex()
 		r.matchIndex[p] = 0
 	}
+	r.peerAck = map[int]uint64{}
 	r.matchIndex[r.id] = r.lastIndex()
 	r.advanceCommitLocked()
 	r.broadcastLocked()
@@ -523,6 +606,7 @@ func (r *Raft) stepDownLocked(term int) {
 		r.logf("stepping down to follower in term %d", r.currentTerm)
 	}
 	r.state = Follower
+	r.failReadsLocked()
 }
 
 func (r *Raft) resetElectionTimerLocked() {
@@ -572,7 +656,7 @@ func (r *Raft) replicateTo(peer int) {
 		r.sendSnapshot(peer) // unlocks
 		return
 	}
-	term := r.currentTerm
+	term, round := r.currentTerm, r.hbRound
 	prev := r.nextIndex[peer] - 1
 	end := min(r.lastIndex(), prev+maxEntriesPerRPC)
 	entries := make([]LogEntry, end-prev)
@@ -601,6 +685,7 @@ func (r *Raft) replicateTo(peer int) {
 	if r.state != Leader || r.currentTerm != term {
 		return
 	}
+	r.ackLocked(peer, round) // any reply in our term confirms leadership
 
 	if reply.Success {
 		r.recordMatchLocked(peer, prev+len(entries))
@@ -623,7 +708,7 @@ func (r *Raft) replicateTo(peer int) {
 
 // sendSnapshot is called with mu held and releases it.
 func (r *Raft) sendSnapshot(peer int) {
-	term := r.currentTerm
+	term, round := r.currentTerm, r.hbRound
 	args := &InstallSnapshotArgs{
 		Term:              term,
 		LeaderID:          r.id,
@@ -645,6 +730,7 @@ func (r *Raft) sendSnapshot(peer int) {
 		return
 	}
 	if r.state == Leader && r.currentTerm == term {
+		r.ackLocked(peer, round)
 		r.recordMatchLocked(peer, args.LastIncludedIndex)
 	}
 }

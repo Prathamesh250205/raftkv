@@ -69,8 +69,12 @@ type Store struct {
 	raft          *raft.Raft
 	timeout       time.Duration
 	snapshotEvery int
+	// LogReads sends reads through the Raft log instead of ReadIndex. Slower;
+	// kept for benchmarking the difference.
+	LogReads bool
 
 	mu           sync.Mutex
+	appliedCond  *sync.Cond // signalled whenever lastApplied advances
 	data         map[string]string
 	sessions     map[string]session
 	waiters      map[int]chan applied // log index -> submitter waiting for it
@@ -90,12 +94,49 @@ func NewStore(r *raft.Raft, applyCh <-chan raft.ApplyMsg, snapshotEvery int) *St
 		sessions:      map[string]session{},
 		waiters:       map[int]chan applied{},
 	}
+	s.appliedCond = sync.NewCond(&s.mu)
 	go func() {
 		for msg := range applyCh {
 			s.apply(msg)
 		}
 	}()
 	return s
+}
+
+// Get performs a linearizable read. It confirms leadership with ReadIndex,
+// waits until the local state has caught up to that index, and reads from
+// memory, so no log entry or fsync is needed.
+func (s *Store) Get(key string) (Result, error) {
+	if s.LogReads {
+		return s.Do(Command{Op: OpGet, Key: key})
+	}
+	idx, err := s.raft.ReadIndex(s.timeout)
+	switch {
+	case errors.Is(err, raft.ErrLeaderNotReady):
+		return s.Do(Command{Op: OpGet, Key: key}) // fresh leader: the log path is still safe
+	case errors.Is(err, raft.ErrNotLeader):
+		return Result{}, ErrNotLeader
+	case err != nil:
+		return Result{}, ErrTimeout
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deadline := time.Now().Add(s.timeout)
+	timer := time.AfterFunc(s.timeout, func() {
+		s.mu.Lock()
+		s.appliedCond.Broadcast()
+		s.mu.Unlock()
+	})
+	defer timer.Stop()
+	for s.lastApplied < idx {
+		if time.Now().After(deadline) {
+			return Result{}, ErrTimeout
+		}
+		s.appliedCond.Wait()
+	}
+	v, ok := s.data[key]
+	return Result{Value: v, Found: ok}, nil
 }
 
 // Do replicates cmd through Raft and returns its result once committed and applied.
@@ -149,6 +190,7 @@ func (s *Store) apply(msg raft.ApplyMsg) {
 		return // already covered by a snapshot
 	}
 	s.lastApplied = msg.Index
+	s.appliedCond.Broadcast()
 
 	var cmd Command
 	var res Result
@@ -192,6 +234,7 @@ func (s *Store) installSnapshotLocked(msg raft.ApplyMsg) {
 		s.sessions = map[string]session{}
 	}
 	s.lastApplied, s.lastSnapshot = msg.Index, msg.Index
+	s.appliedCond.Broadcast()
 
 	// Proposals at indices the snapshot covers can't be matched to a result any
 	// more. Their submitters get ErrLeadershipLost and retry; sessions keep the

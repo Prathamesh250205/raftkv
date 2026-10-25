@@ -55,7 +55,13 @@ func (h *handler) kv(op Op) http.HandlerFunc {
 			cmd.Value = string(body)
 		}
 
-		res, err := h.store.Do(cmd)
+		var res Result
+		var err error
+		if op == OpGet {
+			res, err = h.store.Get(cmd.Key)
+		} else {
+			res, err = h.store.Do(cmd)
+		}
 		switch {
 		case errors.Is(err, ErrNotLeader):
 			h.redirectToLeader(w, req)

@@ -1,6 +1,6 @@
 // Package raft implements the Raft consensus algorithm (Ongaro & Ousterhout, 2014):
-// leader election, log replication and durable state. Section numbers in comments
-// refer to the extended Raft paper.
+// leader election, log replication, durable state and log compaction. Section
+// numbers in comments refer to the extended Raft paper.
 package raft
 
 import (
@@ -53,10 +53,15 @@ type LogEntry struct {
 }
 
 // ApplyMsg is delivered on ApplyCh, in log order, once an entry is committed.
+// When SnapshotValid is set it carries a snapshot instead: the service must
+// replace its whole state with Snapshot, which covers every entry up to Index.
 type ApplyMsg struct {
 	Index   int
 	Term    int
 	Command []byte
+
+	SnapshotValid bool
+	Snapshot      []byte
 }
 
 type Config struct {
@@ -69,13 +74,14 @@ type Config struct {
 }
 
 type Status struct {
-	ID           int    `json:"id"`
-	State        string `json:"state"`
-	Term         int    `json:"term"`
-	LeaderID     int    `json:"leader_id"`
-	CommitIndex  int    `json:"commit_index"`
-	LastApplied  int    `json:"last_applied"`
-	LastLogIndex int    `json:"last_log_index"`
+	ID            int    `json:"id"`
+	State         string `json:"state"`
+	Term          int    `json:"term"`
+	LeaderID      int    `json:"leader_id"`
+	CommitIndex   int    `json:"commit_index"`
+	LastApplied   int    `json:"last_applied"`
+	LastLogIndex  int    `json:"last_log_index"`
+	SnapshotIndex int    `json:"snapshot_index"`
 }
 
 type Raft struct {
@@ -89,16 +95,21 @@ type Raft struct {
 	applyCh   chan<- ApplyMsg
 	logger    *log.Logger
 
-	// Persistent state (§5, Figure 2). log[0] is a sentinel so real entries start at index 1.
+	// Persistent state (§5, Figure 2). The log holds entries snapIndex..lastIndex();
+	// log[0] stands in for the last entry covered by the snapshot (or for index 0
+	// before any snapshot) and only its Term is meaningful.
 	currentTerm int
 	votedFor    int
 	log         []LogEntry
+	snapIndex   int
+	snapshot    []byte // the service's state as of snapIndex
 
 	// Volatile state.
-	state       State
-	leaderID    int
-	commitIndex int
-	lastApplied int
+	state           State
+	leaderID        int
+	commitIndex     int
+	lastApplied     int
+	pendingSnapshot bool // snapshot installed or restored, not yet handed to the service
 
 	// Leader-only state, reinitialised after each election.
 	nextIndex  map[int]int
@@ -184,17 +195,34 @@ func (r *Raft) Start(cmd []byte) (index, term int, isLeader bool) {
 	return r.lastIndex(), r.currentTerm, true
 }
 
+// Snapshot tells Raft that the service has captured its state up to and
+// including index in data, so log entries up to index can be discarded (§7).
+// The service calls it after applying index.
+func (r *Raft) Snapshot(index int, data []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if index <= r.snapIndex || index > r.commitIndex || r.killed() {
+		return
+	}
+	r.log = append([]LogEntry{{Term: r.termAt(index)}}, r.log[index-r.snapIndex+1:]...)
+	r.snapIndex = index
+	r.snapshot = data
+	r.persistSnapshotLocked()
+	r.logf("snapshot at index %d, %d entries left in log", index, len(r.log)-1)
+}
+
 func (r *Raft) Status() Status {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return Status{
-		ID:           r.id,
-		State:        r.state.String(),
-		Term:         r.currentTerm,
-		LeaderID:     r.leaderID,
-		CommitIndex:  r.commitIndex,
-		LastApplied:  r.lastApplied,
-		LastLogIndex: r.lastIndex(),
+		ID:            r.id,
+		State:         r.state.String(),
+		Term:          r.currentTerm,
+		LeaderID:      r.leaderID,
+		CommitIndex:   r.commitIndex,
+		LastApplied:   r.lastApplied,
+		LastLogIndex:  r.lastIndex(),
+		SnapshotIndex: r.snapIndex,
 	}
 }
 
@@ -244,6 +272,18 @@ type AppendEntriesReply struct {
 	ConflictTerm  int // -1 when the follower's log is simply too short
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 func (r *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -276,28 +316,30 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	if r.killed() {
 		return ErrStopped
 	}
-	reply.Term = r.currentTerm
-	if args.Term < r.currentTerm {
+	if !r.acceptLeaderLocked(args.Term, args.LeaderID) {
+		reply.Term = r.currentTerm
 		return nil
 	}
-	if args.Term > r.currentTerm {
-		r.stepDownLocked(args.Term)
-	} else if r.state == Candidate {
-		r.state = Follower // someone else won this term
-	}
 	reply.Term = r.currentTerm
-	r.leaderID = args.LeaderID
-	r.resetElectionTimerLocked()
+
+	prev, prevTerm, entries := args.PrevLogIndex, args.PrevLogTerm, args.Entries
+	if prev < r.snapIndex {
+		// Entries up to snapIndex are committed here already and therefore match
+		// the leader's; skip that prefix.
+		skip := min(r.snapIndex-prev, len(entries))
+		entries = entries[skip:]
+		prev, prevTerm = r.snapIndex, r.termAt(r.snapIndex)
+	}
 
 	// Consistency check (§5.3).
-	if args.PrevLogIndex > r.lastIndex() {
+	if prev > r.lastIndex() {
 		reply.ConflictIndex = r.lastIndex() + 1
 		reply.ConflictTerm = -1
 		return nil
 	}
-	if t := r.log[args.PrevLogIndex].Term; t != args.PrevLogTerm {
-		i := args.PrevLogIndex
-		for i > 1 && r.log[i-1].Term == t {
+	if t := r.termAt(prev); t != prevTerm {
+		i := prev
+		for i > r.snapIndex+1 && r.termAt(i-1) == t {
 			i--
 		}
 		reply.ConflictIndex = i
@@ -308,15 +350,15 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	// Append new entries, truncating only on a real conflict so that a delayed,
 	// stale RPC can never erase entries this follower already has.
 	changed := false
-	for i, e := range args.Entries {
-		idx := args.PrevLogIndex + 1 + i
+	for i, e := range entries {
+		idx := prev + 1 + i
 		if idx <= r.lastIndex() {
-			if r.log[idx].Term == e.Term {
+			if r.termAt(idx) == e.Term {
 				continue
 			}
-			r.log = r.log[:idx]
+			r.log = r.log[:idx-r.snapIndex]
 		}
-		r.log = append(r.log, args.Entries[i:]...)
+		r.log = append(r.log, entries[i:]...)
 		changed = true
 		break
 	}
@@ -324,12 +366,61 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		r.persistLocked()
 	}
 
-	if args.LeaderCommit > r.commitIndex {
-		r.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+	if commit := min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries)); commit > r.commitIndex {
+		r.commitIndex = commit
 		r.applyCond.Broadcast()
 	}
 	reply.Success = true
 	return nil
+}
+
+func (r *Raft) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.killed() {
+		return ErrStopped
+	}
+	if !r.acceptLeaderLocked(args.Term, args.LeaderID) {
+		reply.Term = r.currentTerm
+		return nil
+	}
+	reply.Term = r.currentTerm
+
+	if args.LastIncludedIndex <= r.commitIndex {
+		return nil // we already have everything this snapshot covers
+	}
+	// Keep any log suffix that follows the snapshot and agrees with it (§7).
+	lii, lit := args.LastIncludedIndex, args.LastIncludedTerm
+	if lii <= r.lastIndex() && r.termAt(lii) == lit {
+		r.log = append([]LogEntry{{Term: lit}}, r.log[lii-r.snapIndex+1:]...)
+	} else {
+		r.log = []LogEntry{{Term: lit}}
+	}
+	r.snapIndex = lii
+	r.snapshot = args.Data
+	r.commitIndex = lii
+	r.lastApplied = lii
+	r.pendingSnapshot = true
+	r.persistSnapshotLocked()
+	r.applyCond.Broadcast()
+	r.logf("installed snapshot at index %d from leader %d", lii, args.LeaderID)
+	return nil
+}
+
+// acceptLeaderLocked handles the term check shared by leader RPCs. It returns
+// false if the sender is stale; otherwise this node follows the sender.
+func (r *Raft) acceptLeaderLocked(term, leader int) bool {
+	if term < r.currentTerm {
+		return false
+	}
+	if term > r.currentTerm {
+		r.stepDownLocked(term)
+	} else if r.state == Candidate {
+		r.state = Follower // someone else won this term
+	}
+	r.leaderID = leader
+	r.resetElectionTimerLocked()
+	return true
 }
 
 // ---- Elections ----
@@ -469,23 +560,28 @@ func (r *Raft) replicator(peer int) {
 }
 
 // replicateTo sends one AppendEntries to peer, carrying every entry it is missing
-// (up to maxEntriesPerRPC), or an empty heartbeat if it is up to date.
+// (up to maxEntriesPerRPC), or an empty heartbeat if it is up to date. A peer
+// that needs entries already compacted away gets the snapshot instead.
 func (r *Raft) replicateTo(peer int) {
 	r.mu.Lock()
 	if r.state != Leader || r.killed() {
 		r.mu.Unlock()
 		return
 	}
+	if r.nextIndex[peer] <= r.snapIndex {
+		r.sendSnapshot(peer) // unlocks
+		return
+	}
 	term := r.currentTerm
 	prev := r.nextIndex[peer] - 1
 	end := min(r.lastIndex(), prev+maxEntriesPerRPC)
 	entries := make([]LogEntry, end-prev)
-	copy(entries, r.log[prev+1:end+1])
+	copy(entries, r.log[prev+1-r.snapIndex:end+1-r.snapIndex])
 	args := &AppendEntriesArgs{
 		Term:         term,
 		LeaderID:     r.id,
 		PrevLogIndex: prev,
-		PrevLogTerm:  r.log[prev].Term,
+		PrevLogTerm:  r.termAt(prev),
 		Entries:      entries,
 		LeaderCommit: r.commitIndex,
 	}
@@ -507,24 +603,14 @@ func (r *Raft) replicateTo(peer int) {
 	}
 
 	if reply.Success {
-		match := prev + len(entries)
-		if match > r.matchIndex[peer] {
-			r.matchIndex[peer] = match
-		}
-		if match+1 > r.nextIndex[peer] {
-			r.nextIndex[peer] = match + 1
-		}
-		r.advanceCommitLocked()
-		if r.nextIndex[peer] <= r.lastIndex() {
-			signal(r.replCh[peer]) // more batches to send
-		}
+		r.recordMatchLocked(peer, prev+len(entries))
 		return
 	}
 
 	next := reply.ConflictIndex
 	if reply.ConflictTerm >= 0 {
-		for i := r.lastIndex(); i > 0 && r.log[i].Term >= reply.ConflictTerm; i-- {
-			if r.log[i].Term == reply.ConflictTerm {
+		for i := r.lastIndex(); i > r.snapIndex && r.termAt(i) >= reply.ConflictTerm; i-- {
+			if r.termAt(i) == reply.ConflictTerm {
 				next = i + 1
 				break
 			}
@@ -535,10 +621,51 @@ func (r *Raft) replicateTo(peer int) {
 	signal(r.replCh[peer])
 }
 
+// sendSnapshot is called with mu held and releases it.
+func (r *Raft) sendSnapshot(peer int) {
+	term := r.currentTerm
+	args := &InstallSnapshotArgs{
+		Term:              term,
+		LeaderID:          r.id,
+		LastIncludedIndex: r.snapIndex,
+		LastIncludedTerm:  r.termAt(r.snapIndex),
+		Data:              r.snapshot,
+	}
+	r.mu.Unlock()
+
+	var reply InstallSnapshotReply
+	if err := r.transport.InstallSnapshot(peer, args, &reply); err != nil {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if reply.Term > r.currentTerm {
+		r.stepDownLocked(reply.Term)
+		return
+	}
+	if r.state == Leader && r.currentTerm == term {
+		r.recordMatchLocked(peer, args.LastIncludedIndex)
+	}
+}
+
+func (r *Raft) recordMatchLocked(peer, match int) {
+	if match > r.matchIndex[peer] {
+		r.matchIndex[peer] = match
+	}
+	if match+1 > r.nextIndex[peer] {
+		r.nextIndex[peer] = match + 1
+	}
+	r.advanceCommitLocked()
+	if r.nextIndex[peer] <= r.lastIndex() {
+		signal(r.replCh[peer]) // more batches to send
+	}
+}
+
 // advanceCommitLocked commits the highest index replicated on a majority.
 // Only entries from the current term are committed by counting replicas (§5.4.2).
 func (r *Raft) advanceCommitLocked() {
-	for n := r.lastIndex(); n > r.commitIndex && r.log[n].Term == r.currentTerm; n-- {
+	for n := r.lastIndex(); n > r.commitIndex && r.termAt(n) == r.currentTerm; n-- {
 		count := 0
 		for _, p := range r.peers {
 			if r.matchIndex[p] >= n {
@@ -556,18 +683,31 @@ func (r *Raft) advanceCommitLocked() {
 func (r *Raft) applier() {
 	for {
 		r.mu.Lock()
-		for r.lastApplied >= r.commitIndex && !r.killed() {
+		for !r.pendingSnapshot && r.lastApplied >= r.commitIndex && !r.killed() {
 			r.applyCond.Wait()
 		}
 		if r.killed() {
 			r.mu.Unlock()
 			return
 		}
-		msgs := make([]ApplyMsg, 0, r.commitIndex-r.lastApplied)
-		for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
-			msgs = append(msgs, ApplyMsg{Index: i, Term: r.log[i].Term, Command: r.log[i].Command})
+
+		var msgs []ApplyMsg
+		if r.pendingSnapshot {
+			r.pendingSnapshot = false
+			msgs = []ApplyMsg{{
+				SnapshotValid: true,
+				Snapshot:      r.snapshot,
+				Index:         r.snapIndex,
+				Term:          r.termAt(r.snapIndex),
+			}}
+		} else {
+			// lastApplied >= snapIndex always holds, so these entries are all in the log.
+			for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
+				e := r.entry(i)
+				msgs = append(msgs, ApplyMsg{Index: i, Term: e.Term, Command: e.Command})
+			}
+			r.lastApplied = r.commitIndex
 		}
-		r.lastApplied = r.commitIndex
 		r.mu.Unlock()
 
 		for _, m := range msgs {
@@ -585,7 +725,16 @@ func (r *Raft) applier() {
 type persistentState struct {
 	CurrentTerm int
 	VotedFor    int
+	SnapIndex   int
 	Log         []LogEntry
+}
+
+// snapshotFile is what reaches disk for a snapshot. Its index and term let
+// restore reconcile a crash between writing the snapshot and the state.
+type snapshotFile struct {
+	Index int
+	Term  int
+	Data  []byte
 }
 
 // persistLocked durably saves the current state before returning. It is used for
@@ -595,8 +744,17 @@ func (r *Raft) persistLocked() {
 	if r.killed() {
 		return
 	}
-	data, version := r.snapshotLocked()
-	r.save(data, version)
+	data, version := r.encodeLocked()
+	r.save(data, nil, version)
+}
+
+// persistSnapshotLocked saves the state together with a new snapshot.
+func (r *Raft) persistSnapshotLocked() {
+	if r.killed() {
+		return
+	}
+	data, version := r.encodeLocked()
+	r.save(data, encode(snapshotFile{r.snapIndex, r.termAt(r.snapIndex), r.snapshot}), version)
 }
 
 // flusher is the group-commit loop: each pass saves everything the leader has
@@ -613,11 +771,11 @@ func (r *Raft) flusher() {
 			r.mu.Unlock()
 			return
 		}
-		data, version := r.snapshotLocked()
+		data, version := r.encodeLocked()
 		term, durable := r.currentTerm, r.lastIndex()
 		r.mu.Unlock()
 
-		r.save(data, version) // slow part, done without holding mu
+		r.save(data, nil, version) // slow part, done without holding mu
 
 		r.mu.Lock()
 		// The log is never truncated during a leader's own term, so everything up
@@ -630,46 +788,74 @@ func (r *Raft) flusher() {
 	}
 }
 
-func (r *Raft) snapshotLocked() ([]byte, uint64) {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(persistentState{r.currentTerm, r.votedFor, r.log}); err != nil {
-		panic(fmt.Sprintf("raft: encode state: %v", err))
-	}
+func (r *Raft) encodeLocked() ([]byte, uint64) {
 	r.stateVersion++
-	return buf.Bytes(), r.stateVersion
+	return encode(persistentState{r.currentTerm, r.votedFor, r.snapIndex, r.log}), r.stateVersion
 }
 
-func (r *Raft) save(data []byte, version uint64) {
+func (r *Raft) save(state, snapshot []byte, version uint64) {
 	r.persistMu.Lock()
 	defer r.persistMu.Unlock()
 	if version <= r.savedVersion {
-		return // a newer snapshot already reached disk
+		return // newer state already reached disk
 	}
 	// Continuing without durable state could break safety, so failing to save is fatal.
-	if err := r.persister.Save(data); err != nil {
+	if err := r.persister.Save(state, snapshot); err != nil {
 		panic(fmt.Sprintf("raft: persist state: %v", err))
 	}
 	r.savedVersion = version
 }
 
 func (r *Raft) restore() error {
-	data, err := r.persister.Load()
-	if err != nil || len(data) == 0 {
+	data, snapData, err := r.persister.Load()
+	if err != nil {
 		return err
 	}
-	var st persistentState
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&st); err != nil {
-		return fmt.Errorf("raft: decode state: %w", err)
+	if len(data) > 0 {
+		var st persistentState
+		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&st); err != nil {
+			return fmt.Errorf("raft: decode state: %w", err)
+		}
+		r.currentTerm, r.votedFor, r.snapIndex, r.log = st.CurrentTerm, st.VotedFor, st.SnapIndex, st.Log
 	}
-	r.currentTerm, r.votedFor, r.log = st.CurrentTerm, st.VotedFor, st.Log
-	r.logf("restored term %d with %d log entries", r.currentTerm, r.lastIndex())
+	if len(snapData) > 0 {
+		var snap snapshotFile
+		if err := gob.NewDecoder(bytes.NewReader(snapData)).Decode(&snap); err != nil {
+			return fmt.Errorf("raft: decode snapshot: %w", err)
+		}
+		if snap.Index > r.snapIndex {
+			// Crashed after writing the snapshot but before the state that trims the log.
+			if snap.Index <= r.lastIndex() && r.termAt(snap.Index) == snap.Term {
+				r.log = append([]LogEntry{{Term: snap.Term}}, r.log[snap.Index-r.snapIndex+1:]...)
+			} else {
+				r.log = []LogEntry{{Term: snap.Term}}
+			}
+			r.snapIndex = snap.Index
+		}
+		r.snapshot = snap.Data
+		r.commitIndex, r.lastApplied = r.snapIndex, r.snapIndex
+		r.pendingSnapshot = true
+	}
+	if len(data) > 0 || len(snapData) > 0 {
+		r.logf("restored term %d, snapshot at %d, log up to %d", r.currentTerm, r.snapIndex, r.lastIndex())
+	}
 	return nil
+}
+
+func encode(v any) []byte {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(v); err != nil {
+		panic(fmt.Sprintf("raft: encode: %v", err))
+	}
+	return buf.Bytes()
 }
 
 // ---- Helpers ----
 
-func (r *Raft) lastIndex() int { return len(r.log) - 1 }
-func (r *Raft) lastTerm() int  { return r.log[len(r.log)-1].Term }
+func (r *Raft) lastIndex() int       { return r.snapIndex + len(r.log) - 1 }
+func (r *Raft) lastTerm() int        { return r.log[len(r.log)-1].Term }
+func (r *Raft) termAt(i int) int     { return r.log[i-r.snapIndex].Term }
+func (r *Raft) entry(i int) LogEntry { return r.log[i-r.snapIndex] }
 
 func (r *Raft) logf(format string, args ...any) {
 	if r.logger != nil {

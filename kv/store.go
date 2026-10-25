@@ -4,7 +4,9 @@
 package kv
 
 import (
+	"bytes"
 	"crypto/rand"
+	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -53,27 +55,40 @@ type applied struct {
 }
 
 type session struct {
-	seq uint64
-	res Result
+	Seq uint64
+	Res Result
+}
+
+// snapshot is the store's entire replicated state, as handed to Raft for compaction.
+type snapshot struct {
+	Data     map[string]string
+	Sessions map[string]session
 }
 
 type Store struct {
-	raft    *raft.Raft
-	timeout time.Duration
+	raft          *raft.Raft
+	timeout       time.Duration
+	snapshotEvery int
 
-	mu       sync.Mutex
-	data     map[string]string
-	sessions map[string]session
-	waiters  map[int]chan applied // log index -> submitter waiting for it
+	mu           sync.Mutex
+	data         map[string]string
+	sessions     map[string]session
+	waiters      map[int]chan applied // log index -> submitter waiting for it
+	lastApplied  int
+	lastSnapshot int
 }
 
-func NewStore(r *raft.Raft, applyCh <-chan raft.ApplyMsg) *Store {
+// NewStore starts applying committed entries from applyCh. Every snapshotEvery
+// applied entries it hands Raft a snapshot so the log can be compacted; 0
+// disables snapshots.
+func NewStore(r *raft.Raft, applyCh <-chan raft.ApplyMsg, snapshotEvery int) *Store {
 	s := &Store{
-		raft:     r,
-		timeout:  2 * time.Second,
-		data:     map[string]string{},
-		sessions: map[string]session{},
-		waiters:  map[int]chan applied{},
+		raft:          r,
+		timeout:       2 * time.Second,
+		snapshotEvery: snapshotEvery,
+		data:          map[string]string{},
+		sessions:      map[string]session{},
+		waiters:       map[int]chan applied{},
 	}
 	go func() {
 		for msg := range applyCh {
@@ -126,6 +141,15 @@ func (s *Store) apply(msg raft.ApplyMsg) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if msg.SnapshotValid {
+		s.installSnapshotLocked(msg)
+		return
+	}
+	if msg.Index <= s.lastApplied {
+		return // already covered by a snapshot
+	}
+	s.lastApplied = msg.Index
+
 	var cmd Command
 	var res Result
 	if len(msg.Command) > 0 { // empty means a leader no-op
@@ -139,13 +163,52 @@ func (s *Store) apply(msg raft.ApplyMsg) {
 		ch <- applied{reqID: cmd.ReqID, res: res}
 		delete(s.waiters, msg.Index)
 	}
+
+	if s.snapshotEvery > 0 && msg.Index-s.lastSnapshot >= s.snapshotEvery {
+		var buf bytes.Buffer
+		if err := gob.NewEncoder(&buf).Encode(snapshot{s.data, s.sessions}); err != nil {
+			log.Printf("kv: encode snapshot: %v", err)
+			return
+		}
+		s.raft.Snapshot(msg.Index, buf.Bytes())
+		s.lastSnapshot = msg.Index
+	}
+}
+
+func (s *Store) installSnapshotLocked(msg raft.ApplyMsg) {
+	if msg.Index <= s.lastApplied {
+		return
+	}
+	var snap snapshot
+	if err := gob.NewDecoder(bytes.NewReader(msg.Snapshot)).Decode(&snap); err != nil {
+		log.Printf("kv: decode snapshot at %d: %v", msg.Index, err)
+		return
+	}
+	s.data, s.sessions = snap.Data, snap.Sessions
+	if s.data == nil {
+		s.data = map[string]string{}
+	}
+	if s.sessions == nil {
+		s.sessions = map[string]session{}
+	}
+	s.lastApplied, s.lastSnapshot = msg.Index, msg.Index
+
+	// Proposals at indices the snapshot covers can't be matched to a result any
+	// more. Their submitters get ErrLeadershipLost and retry; sessions keep the
+	// retry from applying a write twice.
+	for idx, ch := range s.waiters {
+		if idx <= msg.Index {
+			ch <- applied{}
+			delete(s.waiters, idx)
+		}
+	}
 }
 
 func (s *Store) executeLocked(cmd Command) Result {
 	dedup := cmd.ClientID != "" && cmd.Op != OpGet
 	if dedup {
-		if sess, ok := s.sessions[cmd.ClientID]; ok && cmd.Seq <= sess.seq {
-			return sess.res
+		if sess, ok := s.sessions[cmd.ClientID]; ok && cmd.Seq <= sess.Seq {
+			return sess.Res
 		}
 	}
 
@@ -162,7 +225,7 @@ func (s *Store) executeLocked(cmd Command) Result {
 	}
 
 	if dedup {
-		s.sessions[cmd.ClientID] = session{seq: cmd.Seq, res: res}
+		s.sessions[cmd.ClientID] = session{Seq: cmd.Seq, Res: res}
 	}
 	return res
 }

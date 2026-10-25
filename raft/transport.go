@@ -15,6 +15,7 @@ import (
 type Transport interface {
 	RequestVote(peer int, args *RequestVoteArgs, reply *RequestVoteReply) error
 	AppendEntries(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) error
+	InstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) error
 }
 
 // RPCPath is where NewRPCHandler should be mounted. Raft traffic shares the
@@ -33,6 +34,10 @@ func (s *rpcService) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 
 func (s *rpcService) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	return s.r.HandleAppendEntries(args, reply)
+}
+
+func (s *rpcService) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	return s.r.HandleInstallSnapshot(args, reply)
 }
 
 // NewRPCHandler serves r's RPC handlers over net/rpc (gob encoding, HTTP CONNECT).
@@ -65,10 +70,18 @@ func (t *HTTPTransport) AppendEntries(peer int, args *AppendEntriesArgs, reply *
 	return t.call(peer, "Raft.AppendEntries", args, reply)
 }
 
-func (t *HTTPTransport) call(peer int, method string, args, reply any) error {
+func (t *HTTPTransport) InstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	return t.call(peer, "Raft.InstallSnapshot", args, reply, 5*time.Second) // snapshots can be large
+}
+
+func (t *HTTPTransport) call(peer int, method string, args, reply any, timeout ...time.Duration) error {
 	c, err := t.client(peer)
 	if err != nil {
 		return err
+	}
+	wait := t.timeout
+	if len(timeout) > 0 {
+		wait = timeout[0]
 	}
 	call := c.Go(method, args, reply, make(chan *rpc.Call, 1))
 	select {
@@ -77,7 +90,7 @@ func (t *HTTPTransport) call(peer int, method string, args, reply any) error {
 			t.drop(peer, c)
 		}
 		return call.Error
-	case <-time.After(t.timeout):
+	case <-time.After(wait):
 		t.drop(peer, c)
 		return errRPCTimeout
 	}

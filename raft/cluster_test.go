@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"encoding/gob"
 	"errors"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ type cluster struct {
 	connected  []bool
 	applied    []map[int][]byte // per node: log index -> command
 	lastIndex  []int
+	snapEvery  int // if > 0, each node snapshots after every snapEvery entries
 }
 
 var errDropped = errors.New("message dropped")
@@ -54,6 +56,28 @@ func (m *memTransport) AppendEntries(peer int, args *AppendEntriesArgs, reply *A
 		return errDropped
 	}
 	return nil
+}
+
+func (m *memTransport) InstallSnapshot(peer int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	node := m.c.link(m.from, peer)
+	if node == nil {
+		return errDropped
+	}
+	if err := node.HandleInstallSnapshot(args, reply); err != nil {
+		return err
+	}
+	if m.c.link(m.from, peer) == nil {
+		return errDropped
+	}
+	return nil
+}
+
+func newSnapshotCluster(t *testing.T, n, every int) *cluster {
+	c := newCluster(t, n)
+	c.mu.Lock()
+	c.snapEvery = every
+	c.mu.Unlock()
+	return c
 }
 
 func newCluster(t *testing.T, n int) *cluster {
@@ -105,6 +129,9 @@ func (c *cluster) start(i int) {
 			select {
 			case m := <-applyCh:
 				c.record(i, m)
+				if snap := c.maybeSnapshot(i, m); snap != nil {
+					r.Snapshot(m.Index, snap)
+				}
 			case <-r.stopCh:
 				return
 			}
@@ -117,16 +144,48 @@ func (c *cluster) start(i int) {
 func (c *cluster) record(i int, m ApplyMsg) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if m.SnapshotValid {
+		// The test service's snapshot is simply every command it has applied.
+		var applied map[int][]byte
+		if err := gob.NewDecoder(bytes.NewReader(m.Snapshot)).Decode(&applied); err != nil {
+			c.t.Errorf("node %d: decode snapshot: %v", i, err)
+			return
+		}
+		for idx, cmd := range applied {
+			c.checkLocked(i, idx, cmd)
+		}
+		c.applied[i] = applied
+		c.lastIndex[i] = m.Index
+		return
+	}
 	if m.Index != c.lastIndex[i]+1 {
 		c.t.Errorf("node %d applied index %d out of order (last %d)", i, m.Index, c.lastIndex[i])
 	}
-	for j := 0; j < c.n; j++ {
-		if v, ok := c.applied[j][m.Index]; ok && !bytes.Equal(v, m.Command) {
-			c.t.Errorf("index %d: node %d applied %q but node %d applied %q", m.Index, i, m.Command, j, v)
-		}
-	}
+	c.checkLocked(i, m.Index, m.Command)
 	c.applied[i][m.Index] = m.Command
 	c.lastIndex[i] = m.Index
+}
+
+func (c *cluster) checkLocked(i, index int, cmd []byte) {
+	for j := 0; j < c.n; j++ {
+		if v, ok := c.applied[j][index]; ok && !bytes.Equal(v, cmd) {
+			c.t.Errorf("index %d: node %d applied %q but node %d applied %q", index, i, cmd, j, v)
+		}
+	}
+}
+
+// maybeSnapshot returns snapshot data when node i should compact after m.
+func (c *cluster) maybeSnapshot(i int, m ApplyMsg) []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.snapEvery == 0 || m.SnapshotValid || m.Index%c.snapEvery != 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(c.applied[i]); err != nil {
+		c.t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func (c *cluster) crash(i int) {

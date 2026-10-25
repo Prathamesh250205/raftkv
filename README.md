@@ -1,165 +1,263 @@
 # raftkv
 
-A fault-tolerant, linearizable key-value store built on a from-scratch implementation of the
-[Raft consensus algorithm](https://raft.github.io/raft.pdf), written in Go using only the standard library.
+[![CI](https://github.com/Prathamesh250205/raftkv/actions/workflows/ci.yml/badge.svg)](https://github.com/Prathamesh250205/raftkv/actions/workflows/ci.yml)
 
-A cluster of 3 nodes keeps working when any 1 node crashes or is cut off; a cluster of 5
-survives 2. Every acknowledged write is durable and is never lost or reordered.
+A sharded, fault-tolerant, **linearizable** key-value store built on a from-scratch implementation
+of the [Raft consensus algorithm](https://raft.github.io/raft.pdf) in Go. The servers use only the
+standard library.
+
+Keys are hashed across independent Raft groups (Multi-Raft, as in TiKV and CockroachDB). Each
+group keeps working while a minority of its replicas are down, and every acknowledged write
+survives crashes. Correctness is checked by a randomized chaos test with the
+[Porcupine](https://github.com/anishathalye/porcupine) linearizability checker.
+
+| | |
+|---|---|
+| Write throughput | **5,757 ops/s** on a 3-node cluster, 91× the first version |
+| Read throughput | **12,359 ops/s** with ReadIndex, 19× faster than reading through the log |
+| Leader failover | **0.5 s** |
+| Verified | linearizable under random partitions, crashes, restarts, 2% message loss and snapshots |
 
 ## Features
 
-- **Leader election** with randomized timeouts, and the election restriction so only up-to-date nodes can win (§5.2, §5.4.1)
-- **Log replication** with batching and fast conflict backtracking (one round trip per conflicting term, not per entry)
-- **Durable state**: term, vote and log are fsynced and atomically replaced, so nodes recover after a crash
-- **Group commit and batched replication**: one fsync and one RPC cover many client writes, for **18× higher throughput** than the naive design (see [Performance](#performance))
-- **Linearizable reads and writes**: every operation goes through the log, and a leader commits a no-op on election so earlier-term entries commit safely (§5.4.2, §8)
-- **Exactly-once writes**: optional client sessions (`X-Client-ID` + `X-Request-Seq`) deduplicate retries
-- **Simple HTTP API**: followers redirect clients to the current leader
-- **Test harness** that simulates partitions, crashes and restarts, and checks on every apply that no two nodes ever diverge
+**Raft core** ([`raft/`](raft/))
+- Leader election, log replication with fast conflict backtracking, durable state (§5)
+- **Log compaction** with snapshots and `InstallSnapshot` for far-behind followers (§7)
+- **Linearizable reads with ReadIndex**: one heartbeat round, no disk write (§8)
+- **Membership changes** one server at a time, including a leader removing itself (thesis §4)
+- **Disruptive-server protection**: removed nodes cannot depose the leader (thesis §4.2.3)
+- **Leadership transfer** with `TimeoutNow` (thesis §3.10)
+- **Group commit and batched replication**: one fsync and one RPC cover many writes
+
+**Storage and sharding**
+- **Multi-Raft**: keys hashed across N Raft groups, each with its own log, leader and membership
+- **Shared write-ahead log**: all of a node's groups share one append-only, CRC-checked file and one fsync
+- **Shard rebalancing**: move a shard between nodes with `kvctl move-shard`
+- **Leader balancing**: leadership is spread evenly across nodes automatically
+
+**Operations**
+- HTTP API; any node redirects you to the right shard leader
+- **Exactly-once writes** with client sessions (`X-Client-ID` + `X-Request-Seq`)
+- Prometheus `/metrics` and a provisioned **Grafana dashboard**
+- `kvctl` admin CLI, `kvbench` load generator, a Docker Compose cluster and a **chaos script**
+- CI on Linux (race detector) and Windows
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-    C[Client] -- HTTP --> N1
-    subgraph N1[Node 1 · leader]
-        A1[HTTP API] --> S1[KV store] --> R1[Raft]
-        R1 --> D1[(raft-state.bin)]
+flowchart TB
+    C[Client] -- "PUT /kv/user42" --> N1
+    subgraph N1[Node 1]
+        H1[HTTP router] -->|"hash(key) → shard 1"| G11[Raft group 1 · leader]
+        H1 --> G10[Raft group 0]
+        H1 --> G12[Raft group 2]
+        G10 & G11 & G12 --> W1[(shared WAL)]
     end
-    R1 -- AppendEntries / RequestVote --> R2[Node 2 · Raft]
-    R1 -- AppendEntries / RequestVote --> R3[Node 3 · Raft]
+    subgraph N2[Node 2]
+        G21[Raft group 1] --> W2[(shared WAL)]
+    end
+    subgraph N3[Node 3]
+        G31[Raft group 1] --> W3[(shared WAL)]
+    end
+    G11 -- AppendEntries --> G21
+    G11 -- AppendEntries --> G31
 ```
 
-A write follows this path:
+A write goes like this:
 
-1. The client sends `PUT /kv/x` to any node. A follower replies `307` pointing at the leader.
-2. The leader's KV store encodes the command and calls `raft.Start`, which appends it to the log and fsyncs.
-3. The leader replicates the entry with `AppendEntries`. Once a majority have it on disk, it is **committed**.
-4. Every node applies committed entries to its in-memory map in log order. The leader then replies to the client.
+1. A client sends `PUT /kv/user42` to any node. The node hashes the key (FNV-1a) to a shard. If
+   it isn't that shard's leader, it replies `307` with the leader's address.
+2. The shard leader appends the command to its in-memory log and wakes two background loops:
+   - the **flusher**, which writes everything appended so far to the shared WAL with one fsync;
+   - the **replicators**, one per follower, each keeping one `AppendEntries` in flight and
+     batching whatever arrived meanwhile.
+3. Once a majority has the entry on disk, it is **committed**. The leader counts itself only after
+   its own flush. Every replica then applies the entry to its state machine.
+4. The leader replies. A retried write with the same session ID and sequence number is applied
+   at most once.
+
+A read skips the log entirely. The leader records its commit index, confirms it is still leader
+with one round of heartbeat acknowledgements from a majority, waits until that index is applied,
+and answers from memory.
 
 | Package | Responsibility |
 |---|---|
-| [`raft/`](raft/) | Consensus: elections, replication, commit, persistence, RPC transport |
-| [`kv/`](kv/) | State machine, request/commit matching, deduplication, HTTP routes |
-| [`cmd/kvnode`](cmd/kvnode/) | Runs one node |
-| [`cmd/kvbench`](cmd/kvbench/) | Load generator reporting throughput and p50/p95/p99 latency |
+| [`raft/`](raft/) | Consensus, snapshots, membership, leadership transfer, ReadIndex, persisters, RPC transport, in-memory test network |
+| [`kv/`](kv/) | Replicated state machine: commands, sessions, snapshots, key hashing |
+| [`server/`](server/) | One node: a Raft group per shard, HTTP API, routing, leader balancing |
+| [`metrics/`](metrics/) | Dependency-free Prometheus exporter |
+| [`cmd/kvnode`](cmd/kvnode/) | Runs a node |
+| [`cmd/kvctl`](cmd/kvctl/) | Admin CLI: status, add/remove nodes, move shards |
+| [`cmd/kvbench`](cmd/kvbench/) | Load generator with shard-aware routing |
 
-## Getting started
+## Quick start
 
-Requires Go 1.22+.
+Requires Go 1.22 or newer.
 
 ```bash
-go test ./... -race -count=1
+go test ./...
 ```
 
-`-race` needs a C compiler (cgo). On Windows without gcc, run `go test ./... -count=1`.
+### Docker: cluster, dashboard and chaos
 
-Start a 3-node cluster (Windows PowerShell):
+```bash
+docker compose up -d --build     # 3 nodes x 3 shards, Prometheus, Grafana
+./scripts/chaos.sh               # writes for 60 s while nodes are frozen, crashed and partitioned
+```
+
+Open **http://localhost:3000** to watch leaders move, terms step up and latency recover in real time.
+
+### Windows, without Docker
 
 ```powershell
-.\scripts\cluster.ps1
+.\scripts\cluster.ps1 -Shards 3      # builds and starts 3 nodes on ports 8001-8003
+.\bin\kvctl.exe status
+.\scripts\cluster.ps1 -Stop
 ```
 
-Or start the nodes by hand, one terminal each, on any OS:
-
-```bash
-go run ./cmd/kvnode -id 1 -cluster 1=127.0.0.1:8001,2=127.0.0.1:8002,3=127.0.0.1:8003
-go run ./cmd/kvnode -id 2 -cluster 1=127.0.0.1:8001,2=127.0.0.1:8002,3=127.0.0.1:8003
-go run ./cmd/kvnode -id 3 -cluster 1=127.0.0.1:8001,2=127.0.0.1:8002,3=127.0.0.1:8003
-```
-
-Use it (`-L` follows the redirect to the leader):
+Use `curl.exe` instead of `curl` in PowerShell. `-L` follows the redirect to the shard leader:
 
 ```bash
 curl -L -X PUT --data "hello" http://127.0.0.1:8001/kv/greeting
 curl -L http://127.0.0.1:8002/kv/greeting
-curl -L -X DELETE http://127.0.0.1:8003/kv/greeting
+curl -L -X POST --data " world" http://127.0.0.1:8003/kv/greeting/append
+curl -L -X DELETE http://127.0.0.1:8001/kv/greeting
 curl http://127.0.0.1:8001/status
+curl http://127.0.0.1:8001/metrics
 ```
 
-On Windows PowerShell, write `curl.exe` instead of `curl`.
-
-### Try a failover
-
-1. Find the leader with `/status`, then stop that process.
-2. Within about 0.6 s the other two elect a new leader. Reads and writes keep working.
-3. Restart the old node. It rejoins as a follower and catches up from the new leader.
-
-### Benchmark
+### Growing the cluster and moving shards
 
 ```bash
-go run ./cmd/kvbench -addr 127.0.0.1:8001 -workers 32 -duration 10s
+kvnode -id 4 -addr 127.0.0.1:8004 -shards 3 -join      # starts empty
+kvctl -addr 127.0.0.1:8001 add-node 4 127.0.0.1:8004    # joins every shard; catches up via snapshot
+kvctl -addr 127.0.0.1:8001 move-shard 2 1 4 127.0.0.1:8004   # shard 2: node 1 -> node 4
+kvctl -addr 127.0.0.1:8001 remove-node 1
 ```
 
-Point `-addr` at the leader to avoid paying a redirect on every request.
-`.\scripts\bench.ps1` does this automatically: it starts a fresh cluster, finds the leader and runs the benchmark.
+```
+SHARD  LEADER   MEMBERS
+0      1        1=127.0.0.1:8001 2=127.0.0.1:8002 3=127.0.0.1:8003
+1      2        1=127.0.0.1:8001 2=127.0.0.1:8002 3=127.0.0.1:8003
+2      4        2=127.0.0.1:8002 3=127.0.0.1:8003 4=127.0.0.1:8004
+```
 
-## Performance
+## API
 
-3 nodes on one Windows laptop, a fresh cluster for each run, 10-second write benchmark (`scripts/bench.ps1`):
+| Method and path | |
+|---|---|
+| `GET /kv/{key}` | Linearizable read (404 if missing) |
+| `PUT /kv/{key}` | Write the body as the value |
+| `POST /kv/{key}/append` | Append the body to the value |
+| `DELETE /kv/{key}` | Remove a key |
+| `GET /status` | This node's Raft state for every shard |
+| `GET /shards` | Leader and members of every shard (asks other nodes if needed) |
+| `GET/POST /shards/{g}/members`, `DELETE /shards/{g}/members/{id}` | Shard membership |
+| `GET /metrics` | Prometheus metrics |
 
-| Version | Clients | Throughput | p50 | p99 | Errors |
-|---|---|---|---|---|---|
-| Per-write fsync | 32 | 88 ops/s | 375 ms | 542 ms | 0 |
-| **Group commit** | 32 | **554 ops/s** | **54 ms** | **115 ms** | 0 |
-| Per-write fsync | 128 | 63 ops/s | 597 ms | 1371 ms | 799 timeouts |
-| **Group commit** | 128 | **1580 ops/s** | **75 ms** | **188 ms** | 0 |
-
-The first version fsynced once per write while holding the Raft lock, and started new
-replication RPCs for every write. So 32 concurrent writes meant 32 sequential disk flushes on
-the leader, and again on each follower. Two changes fixed this:
-
-1. **Leader group commit.** `Start` appends to the in-memory log and signals a flusher goroutine.
-   Each flush writes everything appended since the last one. While a flush is running, new
-   writes queue up for the next. The leader counts itself toward a majority only for entries
-   already flushed. It still sends entries to followers in parallel with its own disk write,
-   which Raft allows (Ongaro's thesis §10.2.1).
-2. **One replicator per follower.** Each follower has a single goroutine with one AppendEntries
-   in flight. Entries appended while it waits are sent together in the next RPC, so followers
-   also fsync once per batch.
-
-Each save carries a version number, so a slow flush can never overwrite newer state on disk.
-Term and vote changes, and follower appends, still fsync before replying, as Raft requires.
+Requests that reach the wrong node get `307` plus an `X-Raft-Leader` header. `503` with
+`Retry-After` means "no leader right now, retry".
 
 ## Testing
 
-`raft/cluster_test.go` runs whole clusters in memory, with a transport that can drop messages
-between any pair of nodes. The tests cover:
+37 tests across four packages. Raft tests run whole clusters over an in-memory network that can
+drop, delay and partition messages, crash nodes and restart them from their saved state. On every
+applied entry, the harness asserts that **no two nodes ever apply different commands at the same
+index**.
 
-| Test | Scenario |
+| Area | What is tested |
 |---|---|
-| `TestInitialElection` | Exactly one leader is elected, and stays leader while the network is healthy |
-| `TestReElection` | Leader partitioned → new leader; old leader rejoins and steps down; no leader without a majority |
-| `TestBasicAgreement` | Commands commit on all nodes in order |
-| `TestSingleNodeCommits` | A 1-node cluster commits through its own flush alone |
-| `TestConcurrentStarts` | 100 simultaneous proposals each get a unique index and commit everywhere |
-| `TestAgreementWithFollowerDown` | Progress with one follower down; it catches up on rejoin |
-| `TestNoCommitWithoutMajority` | A leader cut off from 3 of 5 nodes cannot commit |
-| `TestDivergentLeaderRejoins` | An isolated leader's uncommitted entries are overwritten |
-| `TestPersistAcrossRestart` | Whole-cluster crash; committed entries survive and are re-applied |
-| `TestLeaderCrashAndRestart` | Leader crash, failover, and recovery |
+| Elections | One leader per term; re-election after a partition; no leader without a majority |
+| Replication | Agreement; follower catch-up; no commit without a majority; a deposed leader's uncommitted entries get overwritten; 100 concurrent proposals |
+| Persistence | Whole-cluster crash and restart; leader crash and recovery |
+| Snapshots | Log stays bounded; lagging follower catches up through `InstallSnapshot`; restart; snapshots under repeated partitions |
+| ReadIndex | Healthy leader; **an isolated leader refuses reads** (no stale data); new leader after commit |
+| Membership | Add; remove a follower; **removed nodes can't disrupt** (without the guard the term climbs from 1 to 11); leader removes itself; one change at a time; restart; **rolling replacement of every founding node** |
+| Leadership transfer | Hand-off; refusal when the target is behind |
+| Shared WAL | Round trip; **torn-tail recovery**; compaction; concurrent batching |
+| Sharded cluster (real HTTP) | End-to-end routing; leader balancing; failover and restart from disk; moving a shard to a new node, which then routes requests for shards it doesn't host |
+| **Linearizability** | 5 nodes, 6 clients, 8 s of gets/puts/appends while a nemesis partitions, crashes and restarts nodes with 2% packet loss. The history (2,500–6,000 ops per run) is checked with Porcupine |
 
-On every apply, the harness asserts that no two nodes hold different commands at the same index,
-which is the key safety property of Raft.
+The linearizability test has already caught one real bug: a concurrent map access when starting
+replicators, which crashed about once in 45 runs
+([fix](https://github.com/Prathamesh250205/raftkv/commit/c083f2c)).
+
+## Performance
+
+All numbers come from 3 nodes on **one Windows laptop**. Each run starts a fresh cluster and lasts
+10 seconds (`scripts/bench.ps1`), with 128 clients unless noted.
+
+### Writes: from 63 to 5,757 ops/s
+
+| Version | Throughput | p50 | p99 |
+|---|---|---|---|
+| fsync on every write, holding the Raft lock | 63 ops/s (799 timeouts) | 597 ms | 1,371 ms |
+| + group commit and batched replication | 1,790 ops/s | 67 ms | 140 ms |
+| + shared write-ahead log | **5,757 ops/s** | **18 ms** | 86 ms |
+
+- **Group commit**: the leader appends in memory, and a flusher goroutine makes everything
+  appended since the last flush durable in one write. Each follower has one replicator with one
+  RPC in flight, so entries batch up while it waits. The leader counts itself toward a majority
+  only after its own flush (Ongaro's thesis §10.2.1). A version number on each save keeps a slow
+  flush from overwriting newer state.
+- **Shared WAL**: appending to one open file avoids creating, fsyncing and renaming a temp file on
+  every save, which is slow on Windows.
+
+### Reads: 19× with ReadIndex (32 clients)
+
+| Reads | Throughput | p50 |
+|---|---|---|
+| Through the Raft log (`-log-reads`) | 642 ops/s | 48 ms |
+| **ReadIndex** | **12,359 ops/s** | **2.3 ms** |
+
+### Sharding on one machine
+
+| Shards | Separate files per shard | Shared WAL |
+|---|---|---|
+| 1 | 1,790 ops/s | 5,757 ops/s |
+| 3 | 809 ops/s | 4,767 ops/s |
+| 6 | 423 ops/s (96 errors) | 3,612 ops/s |
+
+With a file per shard, throughput fell as **1/shards**. The metrics showed why. The disk's flush
+rate was fixed (about 100 flushes/s across the cluster) and the shards split it between them:
+average fsync time rose from 21 ms to 147 ms, and batches shrank from 66 to 14 entries. Sharing
+one log per node, so one fsync covers every shard, made 6 shards **8.5× faster**.
+
+Even so, more shards do **not** beat one shard *on this laptop*. All three "nodes" share one disk
+and one CPU, so there is nothing to spread the work across. Sharding pays off when shards lead on
+different machines with their own disks, and it adds capacity and fault isolation: a node only
+stores the shards it replicates (`-replicas`), and a shard moves with `kvctl move-shard`. Those
+multi-machine gains weren't measured here.
 
 ## Design decisions
 
-- **Reads go through the log.** This is the simplest correct way to get linearizable reads. A deposed leader that doesn't know it lost leadership can't serve stale data. The cost is a replication round trip per read (see the roadmap).
-- **One port per node.** Raft RPCs (`net/rpc` over HTTP `CONNECT`) and the client API share a listener, so cluster config is just `id=host:port`.
-- **Whole-state persistence.** Each flush rewrites the state file via write-then-rename. This is simple and crash-safe, and group commit amortises the cost over many writes. But each flush is still O(log size), so throughput drops as the log grows. An append-only WAL plus snapshots is the fix.
-- **Persistence failures panic.** Continuing after a failed fsync could let a node forget a vote or entry and break safety.
+- **Reads use ReadIndex, not leases.** Leases avoid even the heartbeat round, but they depend on
+  bounded clock drift. ReadIndex is safe no matter what the clocks do.
+- **Single-server membership changes.** Simpler than joint consensus, and safe because any two
+  majorities of configurations that differ by one node overlap. A leader must commit an entry of
+  its own term before changing membership, which avoids the bug described in the thesis errata.
+- **Whole-state records in the WAL.** Each save is the group's full state (bounded by compaction),
+  so recovery only needs the latest record per group. A per-entry WAL would write less per save.
+  Batching made that unnecessary so far.
+- **One port per node.** Client API, admin API, metrics and every shard's Raft RPCs
+  (`/_raft/rpc/{shard}`) share one listener.
+- **Persistence failures are fatal.** Continuing after a failed fsync could make a node forget a
+  vote or an entry, which breaks safety.
 
-## Roadmap
+## Limitations and next steps
 
-- [ ] Log compaction with snapshots and `InstallSnapshot` (§7)
-- [ ] Append-only segmented WAL instead of rewriting the full state
-- [ ] ReadIndex or lease-based reads that skip the log (§8)
-- [ ] Cluster membership changes (joint consensus, §6)
-- [ ] Sharding with multiple Raft groups
-- [ ] Prometheus metrics and a Docker Compose demo with fault injection
+- [ ] **PreVote** (thesis §9.6): a node that rejoins after a partition still bumps the term once and
+      causes one extra election.
+- [ ] **Learners**: a new member counts toward the majority immediately, even while it is still
+      catching up.
+- [ ] **Shard splitting**: the shard count is fixed when the cluster is created; shards can move
+      between nodes but not split.
+- [ ] Per-entry WAL records, and a client library with a cached shard map.
+- [ ] A benchmark on multiple machines.
 
 ## References
 
 - Diego Ongaro and John Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended Version)*, 2014
-- MIT 6.5840 Distributed Systems, Labs 3–4
-- [etcd/raft](https://github.com/etcd-io/raft), a production Raft library
+- Diego Ongaro, *Consensus: Bridging Theory and Practice* (PhD thesis), Stanford, 2014
+- MIT 6.5840 Distributed Systems, Labs 3–5
+- [etcd/raft](https://github.com/etcd-io/raft), [TiKV](https://github.com/tikv/tikv), [Porcupine](https://github.com/anishathalye/porcupine)

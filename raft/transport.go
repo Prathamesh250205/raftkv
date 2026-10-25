@@ -55,10 +55,15 @@ func NewRPCHandler(r *Raft) (http.Handler, error) {
 	return srv, nil
 }
 
+// SecretHeader carries the cluster secret in the CONNECT request that opens
+// each RPC connection; servers can reject peers that don't present it.
+const SecretHeader = "X-Raft-Secret"
+
 // HTTPTransport keeps one persistent RPC connection per peer and redials on failure.
 type HTTPTransport struct {
 	timeout time.Duration
 	path    string
+	secret  string
 
 	mu      sync.Mutex
 	addrs   map[int]string
@@ -74,6 +79,10 @@ func NewHTTPTransport(addrs map[int]string) *HTTPTransport {
 func NewHTTPTransportPath(addrs map[int]string, path string) *HTTPTransport {
 	return &HTTPTransport{addrs: copyMembers(addrs), path: path, timeout: 200 * time.Millisecond, clients: map[int]*rpc.Client{}}
 }
+
+// SetSecret sets the cluster secret sent when opening connections. Call it
+// before the transport is used.
+func (t *HTTPTransport) SetSecret(secret string) { t.secret = secret }
 
 // UpdatePeers replaces the peer address book after a membership change.
 // Connections to peers that left or moved are closed.
@@ -147,7 +156,11 @@ func (t *HTTPTransport) client(peer int) (*rpc.Client, error) {
 		return nil, err
 	}
 	conn.SetDeadline(time.Now().Add(t.timeout))
-	io.WriteString(conn, "CONNECT "+t.path+" HTTP/1.0\n\n")
+	hello := "CONNECT " + t.path + " HTTP/1.0\n"
+	if t.secret != "" {
+		hello += SecretHeader + ": " + t.secret + "\n"
+	}
+	io.WriteString(conn, hello+"\n")
 	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
 	if err != nil || resp.Status != connectedStatus {
 		conn.Close()

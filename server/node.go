@@ -39,8 +39,20 @@ type Config struct {
 	SeparateFiles bool
 	SnapshotEvery int
 	LogReads      bool
-	Logger        *log.Logger  // nil disables logging
-	Listener      net.Listener // optional; otherwise Start listens on Addr
+
+	// AuthToken, if set, is required in the X-Api-Token header for writes and
+	// membership changes, and for reads unless PublicReads is set.
+	AuthToken   string
+	PublicReads bool
+	// ClusterSecret, if set, must be presented by peers opening Raft RPC
+	// connections. Every node needs the same value.
+	ClusterSecret string
+	// Forward passes requests to the shard leader instead of redirecting the
+	// client, for clusters whose nodes use addresses clients can't reach.
+	Forward bool
+
+	Logger   *log.Logger  // nil disables logging
+	Listener net.Listener // optional; otherwise Start listens on Addr
 }
 
 type shard struct {
@@ -200,11 +212,14 @@ func (n *Node) startShard(g int, mux *http.ServeMux) (*shard, error) {
 		logger = log.New(n.cfg.Logger.Writer(), fmt.Sprintf("[node %d shard %d] ", n.cfg.ID, g), n.cfg.Logger.Flags())
 	}
 
+	transport := raft.NewHTTPTransportPath(peers, rpcPath(g))
+	transport.SetSecret(n.cfg.ClusterSecret)
+
 	applyCh := make(chan raft.ApplyMsg, 256)
 	r, err := raft.New(raft.Config{
 		ID:        n.cfg.ID,
 		Peers:     peers,
-		Transport: raft.NewHTTPTransportPath(peers, rpcPath(g)),
+		Transport: transport,
 		Persister: persister,
 		ApplyCh:   applyCh,
 		Logger:    logger,
@@ -220,7 +235,7 @@ func (n *Node) startShard(g int, mux *http.ServeMux) (*shard, error) {
 		r.Stop()
 		return nil, err
 	}
-	mux.Handle(rpcPath(g), rpc)
+	mux.Handle(rpcPath(g), n.guardRPC(rpc))
 	r.RegisterMetrics(n.reg, metrics.Labels{"node": strconv.Itoa(n.cfg.ID), "shard": strconv.Itoa(g)})
 	return &shard{id: g, raft: r, store: store, founders: founders}, nil
 }

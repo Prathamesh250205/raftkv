@@ -24,10 +24,19 @@ import (
 )
 
 var (
-	addr   = flag.String("addr", "127.0.0.1:8001", "any node of the cluster")
+	addr   = flag.String("addr", "127.0.0.1:8001", "any node of the cluster: host:port or a full URL such as https://kv.example.com")
+	token  = flag.String("token", os.Getenv("RAFTKV_AUTH_TOKEN"), "API token for membership changes (default $RAFTKV_AUTH_TOKEN)")
 	only   = flag.Int("shard", -1, "limit add-node/remove-node to one shard")
 	client = &http.Client{Timeout: 10 * time.Second}
 )
+
+// baseURL turns -addr into a URL prefix, defaulting to plain HTTP.
+func baseURL() string {
+	if strings.Contains(*addr, "://") {
+		return strings.TrimSuffix(*addr, "/")
+	}
+	return "http://" + *addr
+}
 
 func main() {
 	flag.Usage = func() {
@@ -121,8 +130,9 @@ func remove(g, id int) error {
 // another change or electing a leader. Redirects to the leader are followed.
 func change(g int, method, path string, body []byte, done string) error {
 	for attempt := 0; ; attempt++ {
-		req, _ := http.NewRequest(method, "http://"+*addr+path, bytes.NewReader(body))
+		req, _ := http.NewRequest(method, baseURL()+path, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(server.TokenHeader, *token)
 		resp, err := client.Do(req)
 		if err != nil {
 			return err
@@ -142,7 +152,7 @@ func change(g int, method, path string, body []byte, done string) error {
 }
 
 func shardMap() ([]server.ShardInfo, error) {
-	resp, err := client.Get("http://" + *addr + "/shards")
+	resp, err := client.Get(baseURL() + "/shards")
 	if err != nil {
 		return nil, err
 	}

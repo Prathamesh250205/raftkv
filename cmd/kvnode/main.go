@@ -38,6 +38,10 @@ func main() {
 	snapshotEvery := flag.Int("snapshot-every", 1000, "compact the log after this many applied entries (0 disables)")
 	logReads := flag.Bool("log-reads", false, "serve reads through the Raft log instead of ReadIndex (for comparison)")
 	wal := flag.String("wal", "shared", "shared: one log for all shards on this node; files: a file set per shard (for comparison)")
+	authToken := flag.String("auth-token", os.Getenv("RAFTKV_AUTH_TOKEN"), "require this X-Api-Token for writes and admin (default $RAFTKV_AUTH_TOKEN)")
+	publicReads := flag.Bool("public-reads", false, "with -auth-token, let anyone read")
+	clusterSecret := flag.String("cluster-secret", os.Getenv("RAFTKV_CLUSTER_SECRET"), "shared secret peers must present for Raft RPCs (default $RAFTKV_CLUSTER_SECRET)")
+	forward := flag.Bool("forward", false, "pass requests to the shard leader instead of redirecting clients (use when -addr is a private address)")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, fmt.Sprintf("[node %d] ", *id), log.Ltime|log.Lmicroseconds)
@@ -51,6 +55,10 @@ func main() {
 		SnapshotEvery: *snapshotEvery,
 		LogReads:      *logReads,
 		SeparateFiles: *wal == "files",
+		AuthToken:     *authToken,
+		PublicReads:   *publicReads,
+		ClusterSecret: *clusterSecret,
+		Forward:       *forward,
 		Logger:        logger,
 	}
 	if *wal != "shared" && *wal != "files" {
@@ -83,6 +91,9 @@ func main() {
 		logger.Fatal(err)
 	}
 	logger.Printf("listening on %s with %d shard(s), data in %s", cfg.Addr, cfg.Shards, cfg.DataDir)
+	if cfg.AuthToken == "" {
+		logger.Print("WARNING: no -auth-token: anyone who can reach this node can write and change membership")
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM) // SIGTERM: docker stop

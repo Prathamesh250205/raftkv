@@ -31,18 +31,22 @@ const maxValueBytes = 1 << 20
 //	GET    /metrics                   Prometheus metrics
 //
 // A key's request goes to the leader of the shard the key hashes to; any
-// other node answers 307 with that leader's address. Optional headers
-// X-Client-ID and X-Request-Seq make retried writes idempotent.
+// other node answers 307 with that leader's address, or passes the request on
+// itself in Forward mode. Optional headers X-Client-ID and X-Request-Seq make
+// retried writes idempotent.
+//
+// With an AuthToken configured, writes and membership changes need it in the
+// X-Api-Token header, and so do reads unless PublicReads is set.
 func (n *Node) registerRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /kv/{key}", n.kv(kv.OpGet))
-	mux.HandleFunc("PUT /kv/{key}", n.kv(kv.OpPut))
-	mux.HandleFunc("POST /kv/{key}/append", n.kv(kv.OpAppend))
-	mux.HandleFunc("DELETE /kv/{key}", n.kv(kv.OpDelete))
+	mux.HandleFunc("GET /kv/{key}", n.requireTokenUnlessPublic(n.kv(kv.OpGet)))
+	mux.HandleFunc("PUT /kv/{key}", n.requireToken(n.kv(kv.OpPut)))
+	mux.HandleFunc("POST /kv/{key}/append", n.requireToken(n.kv(kv.OpAppend)))
+	mux.HandleFunc("DELETE /kv/{key}", n.requireToken(n.kv(kv.OpDelete)))
 	mux.HandleFunc("GET /status", n.status)
 	mux.HandleFunc("GET /shards", n.shardMap)
 	mux.HandleFunc("GET /shards/{g}/members", n.withShard(n.members))
-	mux.HandleFunc("POST /shards/{g}/members", n.withShard(n.addMember))
-	mux.HandleFunc("DELETE /shards/{g}/members/{id}", n.withShard(n.removeMember))
+	mux.HandleFunc("POST /shards/{g}/members", n.requireToken(n.withShard(n.addMember)))
+	mux.HandleFunc("DELETE /shards/{g}/members/{id}", n.requireToken(n.withShard(n.removeMember)))
 	mux.Handle("GET /metrics", n.reg)
 }
 
@@ -51,6 +55,7 @@ const (
 	resultOK          = "ok"
 	resultNotFound    = "not_found"
 	resultRedirect    = "redirect"
+	resultForwarded   = "forwarded"
 	resultUnavailable = "unavailable"
 	resultBadRequest  = "bad_request"
 )
@@ -58,7 +63,7 @@ const (
 func (n *Node) kv(op kv.Op) http.HandlerFunc {
 	// Pre-register every series so dashboards see zeros instead of gaps.
 	counts := map[string]*metrics.Counter{}
-	for _, res := range []string{resultOK, resultNotFound, resultRedirect, resultUnavailable, resultBadRequest} {
+	for _, res := range []string{resultOK, resultNotFound, resultRedirect, resultForwarded, resultUnavailable, resultBadRequest} {
 		counts[res] = &metrics.Counter{}
 		n.reg.Counter("kv_requests_total", "Client requests by operation and outcome.",
 			metrics.Labels{"op": string(op), "result": res}, counts[res])
@@ -106,7 +111,7 @@ func (n *Node) serve(op kv.Op, w http.ResponseWriter, req *http.Request) string 
 	}
 	switch {
 	case errors.Is(err, kv.ErrNotLeader):
-		return n.redirect(sh, w, req)
+		return n.notLeader(sh, w, req, []byte(cmd.Value))
 	case err != nil:
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -256,16 +261,17 @@ func (n *Node) members(sh *shard, w http.ResponseWriter, req *http.Request) {
 }
 
 func (n *Node) addMember(sh *shard, w http.ResponseWriter, req *http.Request) {
+	raw, _ := io.ReadAll(io.LimitReader(req.Body, 4096))
 	var body struct {
 		ID   int    `json:"id"`
 		Addr string `json:"addr"`
 	}
-	if err := json.NewDecoder(io.LimitReader(req.Body, 4096)).Decode(&body); err != nil || body.Addr == "" {
+	if err := json.Unmarshal(raw, &body); err != nil || body.Addr == "" {
 		http.Error(w, `want JSON {"id": <int>, "addr": "host:port"}`, http.StatusBadRequest)
 		return
 	}
 	idx, err := sh.raft.AddMember(body.ID, body.Addr)
-	n.finishChange(sh, w, req, idx, err)
+	n.finishChange(sh, w, req, raw, idx, err)
 }
 
 func (n *Node) removeMember(sh *shard, w http.ResponseWriter, req *http.Request) {
@@ -275,14 +281,14 @@ func (n *Node) removeMember(sh *shard, w http.ResponseWriter, req *http.Request)
 		return
 	}
 	idx, err := sh.raft.RemoveMember(id)
-	n.finishChange(sh, w, req, idx, err)
+	n.finishChange(sh, w, req, nil, idx, err)
 }
 
 // finishChange waits for a membership change to commit and reports the result.
-func (n *Node) finishChange(sh *shard, w http.ResponseWriter, req *http.Request, idx int, err error) {
+func (n *Node) finishChange(sh *shard, w http.ResponseWriter, req *http.Request, body []byte, idx int, err error) {
 	switch {
 	case errors.Is(err, raft.ErrNotLeader):
-		n.redirect(sh, w, req)
+		n.notLeader(sh, w, req, body)
 		return
 	case errors.Is(err, raft.ErrAlreadyMember), errors.Is(err, raft.ErrNotMember), errors.Is(err, raft.ErrLastMember):
 		http.Error(w, err.Error(), http.StatusConflict)

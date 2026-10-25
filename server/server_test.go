@@ -25,13 +25,19 @@ type testCluster struct {
 	nodes  map[int]*Node
 	cfgs   map[int]Config
 	client *http.Client
+	base   Config // security and routing settings every node starts with
 }
 
 func newTestCluster(t *testing.T, n, shards, replicas int) *testCluster {
+	return newTestClusterWith(t, n, shards, replicas, Config{})
+}
+
+func newTestClusterWith(t *testing.T, n, shards, replicas int, base Config) *testCluster {
 	c := &testCluster{
 		t: t, shards: shards, dir: t.TempDir(),
 		addrs: map[int]string{}, nodes: map[int]*Node{}, cfgs: map[int]Config{},
 		client: &http.Client{Timeout: 5 * time.Second},
+		base:   base,
 	}
 	listeners := map[int]net.Listener{}
 	for id := 1; id <= n; id++ {
@@ -55,6 +61,8 @@ func newTestCluster(t *testing.T, n, shards, replicas int) *testCluster {
 
 func (c *testCluster) start(id int, cfg Config) {
 	cfg.ID, cfg.Shards, cfg.SnapshotEvery = id, c.shards, 50
+	cfg.AuthToken, cfg.PublicReads = c.base.AuthToken, c.base.PublicReads
+	cfg.ClusterSecret, cfg.Forward = c.base.ClusterSecret, c.base.Forward
 	if cfg.Addr == "" {
 		cfg.Addr = c.addrs[id]
 	}
@@ -117,6 +125,7 @@ func (c *testCluster) do(method, key, value string) (int, string) {
 	for attempt := 0; attempt < 100; attempt++ {
 		url := "http://" + c.anyAddr(attempt) + "/kv/" + key
 		req, _ := http.NewRequest(method, url, strings.NewReader(value))
+		req.Header.Set(TokenHeader, c.base.AuthToken)
 		resp, err := c.client.Do(req)
 		if err != nil {
 			time.Sleep(50 * time.Millisecond)

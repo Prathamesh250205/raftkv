@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -23,21 +24,31 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8001", "any node of the cluster")
+	addr := flag.String("addr", "127.0.0.1:8001", "any node: host:port or a full URL such as https://kv.example.com")
 	workers := flag.Int("workers", 32, "concurrent clients")
 	duration := flag.Duration("duration", 10*time.Second, "how long to run")
 	op := flag.String("op", "put", "put (writes) or get (linearizable reads)")
+	token := flag.String("token", os.Getenv("RAFTKV_AUTH_TOKEN"), "API token (default $RAFTKV_AUTH_TOKEN)")
+	route := flag.Bool("route", true, "send each key straight to its shard leader; false sends everything to -addr (for clusters running -forward)")
 	flag.Parse()
 	if *op != "put" && *op != "get" {
 		log.Fatalf("unknown -op %q", *op)
 	}
+	base := *addr
+	if !strings.Contains(base, "://") {
+		base = "http://" + base
+	}
+	base = strings.TrimSuffix(base, "/")
 
 	client := &http.Client{
 		Timeout:   5 * time.Second,
 		Transport: &http.Transport{MaxIdleConnsPerHost: *workers},
 	}
-	routes := leaders(client, *addr)
-	fmt.Printf("shards:     %d, leaders %v\n", len(routes), routes)
+	routes := []string{base}
+	if *route {
+		routes = leaders(client, base)
+	}
+	fmt.Printf("shards:     %d, sending to %v\n", len(routes), routes)
 
 	var (
 		mu        sync.Mutex
@@ -52,13 +63,14 @@ func main() {
 			defer wg.Done()
 			for i := 0; time.Now().Before(deadline); i++ {
 				key := fmt.Sprintf("bench-%d-%d", w, i)
-				url := fmt.Sprintf("http://%s/kv/%s", routes[kv.ShardFor(key, len(routes))], key)
+				url := fmt.Sprintf("%s/kv/%s", routes[kv.ShardFor(key, len(routes))], key)
 				var req *http.Request
 				if *op == "put" {
 					req, _ = http.NewRequest(http.MethodPut, url, strings.NewReader("value"))
 				} else {
 					req, _ = http.NewRequest(http.MethodGet, url, nil)
 				}
+				req.Header.Set(server.TokenHeader, *token)
 				start := time.Now()
 				resp, err := client.Do(req)
 				elapsed := time.Since(start)
@@ -90,13 +102,13 @@ func main() {
 	fmt.Printf("latency:    p50 %v  p95 %v  p99 %v\n", pct(0.50), pct(0.95), pct(0.99))
 }
 
-// leaders returns, per shard, the address requests should go to. It waits
+// leaders returns, per shard, the base URL requests should go to. It waits
 // until every shard has elected a leader.
-func leaders(client *http.Client, addr string) []string {
+func leaders(client *http.Client, base string) []string {
 	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(200 * time.Millisecond) {
-		resp, err := client.Get("http://" + addr + "/shards")
+		resp, err := client.Get(base + "/shards")
 		if err != nil {
-			log.Fatalf("cannot reach %s: %v", addr, err)
+			log.Fatalf("cannot reach %s: %v", base, err)
 		}
 		var shards []server.ShardInfo
 		err = json.NewDecoder(resp.Body).Decode(&shards)
@@ -107,7 +119,7 @@ func leaders(client *http.Client, addr string) []string {
 		out := make([]string, len(shards))
 		ready := true
 		for _, s := range shards {
-			out[s.Shard] = s.LeaderAddr
+			out[s.Shard] = "http://" + s.LeaderAddr
 			ready = ready && s.LeaderAddr != ""
 		}
 		if ready {

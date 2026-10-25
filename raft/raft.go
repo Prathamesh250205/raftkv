@@ -141,6 +141,8 @@ type Raft struct {
 	peerAck     map[int]uint64 // latest round each peer has acknowledged
 	readWaiters []readWaiter   // ordered by round
 
+	metrics raftMetrics
+
 	dead   atomic.Bool
 	stopCh chan struct{}
 }
@@ -173,6 +175,7 @@ func New(cfg Config) (*Raft, error) {
 		peerAck:    map[int]uint64{},
 		stopCh:     make(chan struct{}),
 	}
+	r.metrics.init()
 	r.applyCond = sync.NewCond(&r.mu)
 	if err := r.restore(); err != nil {
 		return nil, err
@@ -204,6 +207,7 @@ func (r *Raft) Start(cmd []byte) (index, term int, isLeader bool) {
 		return 0, 0, false
 	}
 	r.log = append(r.log, LogEntry{Term: r.currentTerm, Command: cmd})
+	r.metrics.proposals.Inc()
 	// No fsync here: the flusher batches it, and only then counts the leader
 	// toward a majority. Followers can receive the entry in parallel.
 	signal(r.flushCh)
@@ -224,6 +228,7 @@ func (r *Raft) Snapshot(index int, data []byte) {
 	r.snapIndex = index
 	r.snapshot = data
 	r.persistSnapshotLocked()
+	r.metrics.snapshotsTaken.Inc()
 	r.logf("snapshot at index %d, %d entries left in log", index, len(r.log)-1)
 }
 
@@ -261,8 +266,14 @@ func (r *Raft) ReadIndex(timeout time.Duration) (int, error) {
 
 	select {
 	case err := <-w.done:
+		if err != nil {
+			r.metrics.readIndexFailed.Inc()
+		} else {
+			r.metrics.readIndexOK.Inc()
+		}
 		return readIndex, err
 	case <-time.After(timeout):
+		r.metrics.readIndexFailed.Inc()
 		return 0, ErrReadTimeout
 	}
 }
@@ -488,6 +499,7 @@ func (r *Raft) HandleInstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	r.lastApplied = lii
 	r.pendingSnapshot = true
 	r.persistSnapshotLocked()
+	r.metrics.snapshotsInstalled.Inc()
 	r.applyCond.Broadcast()
 	r.logf("installed snapshot at index %d from leader %d", lii, args.LeaderID)
 	return nil
@@ -540,6 +552,7 @@ func (r *Raft) startElectionLocked() {
 	r.leaderID = -1
 	r.persistLocked()
 	r.resetElectionTimerLocked()
+	r.metrics.electionsStarted.Inc()
 	r.logf("election timeout, starting election for term %d", r.currentTerm)
 
 	term := r.currentTerm
@@ -583,6 +596,7 @@ func (r *Raft) startElectionLocked() {
 func (r *Raft) becomeLeaderLocked() {
 	r.state = Leader
 	r.leaderID = r.id
+	r.metrics.leadershipsWon.Inc()
 	r.logf("became leader for term %d", r.currentTerm)
 
 	// A no-op entry from the new term lets entries from earlier terms commit (§5.4.2, §8).
@@ -674,6 +688,9 @@ func (r *Raft) replicateTo(peer int) {
 		LeaderCommit: r.commitIndex,
 	}
 	r.mu.Unlock()
+	if len(entries) > 0 {
+		r.metrics.batchEntries.Observe(float64(len(entries)))
+	}
 
 	var reply AppendEntriesReply
 	if err := r.transport.AppendEntries(peer, args, &reply); err != nil {
@@ -721,6 +738,7 @@ func (r *Raft) sendSnapshot(peer int) {
 		Data:              r.snapshot,
 	}
 	r.mu.Unlock()
+	r.metrics.snapshotsSent.Inc()
 
 	var reply InstallSnapshotReply
 	if err := r.transport.InstallSnapshot(peer, args, &reply); err != nil {
@@ -890,9 +908,11 @@ func (r *Raft) save(state, snapshot []byte, version uint64) {
 		return // newer state already reached disk
 	}
 	// Continuing without durable state could break safety, so failing to save is fatal.
+	start := time.Now()
 	if err := r.persister.Save(state, snapshot); err != nil {
 		panic(fmt.Sprintf("raft: persist state: %v", err))
 	}
+	r.metrics.fsyncSeconds.Observe(time.Since(start).Seconds())
 	r.savedVersion = version
 }
 

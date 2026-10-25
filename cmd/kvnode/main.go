@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"raftkv/kv"
+	"raftkv/metrics"
 	"raftkv/raft"
 )
 
@@ -70,9 +71,13 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
+	reg := metrics.NewRegistry()
+	r.RegisterMetrics(reg, metrics.Labels{"node": strconv.Itoa(*id)})
+
 	mux := http.NewServeMux()
 	mux.Handle(raft.RPCPath, rpcHandler)
-	kv.RegisterRoutes(mux, store, r, addrs)
+	mux.Handle("GET /metrics", reg)
+	kv.RegisterRoutes(mux, store, r, addrs, reg)
 
 	srv := &http.Server{Addr: self, Handler: mux}
 	go func() {

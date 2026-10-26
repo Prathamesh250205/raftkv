@@ -4,6 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>raftkv: a database that survives crashes</title>
+<script>
+  // Apply a saved theme before first paint, so the page doesn't flash.
+  try { const t = localStorage.getItem("raftkv-theme"); if (t) document.documentElement.dataset.theme = t; } catch (_) {}
+</script>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
 <meta name="description" content="raftkv is a sharded key-value store built on a from-scratch implementation of the Raft consensus algorithm in Go. Crash a machine in the live demo and watch nothing get lost.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -15,12 +25,39 @@
     --amber: #ffb547; --teal: #4fd1c5; --coral: #ff7a85; --crash: #ff4d4d; --ok: #7ee2a8;
     --serif: "Instrument Serif", Georgia, serif; --sans: "IBM Plex Sans", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
     --gutter: clamp(16px, 4vw, 48px); --max: 1180px;
+    --scrim: 10,12,15; --on-accent: #0a0c0f; --glow: #141a22; --grain: .05;
+    color-scheme: dark;
+  }
+  /* light theme: chosen with the toggle, or by the system when no choice is saved */
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) {
+    --ink: #f3efe7; --ink-2: #fbf9f5; --ink-3: #e9e3d8; --rule: #d9d1c3;
+    --paper: #16181c; --paper-dim: #454a53; --muted: #7a7e86;
+    --amber: #d9860b; --teal: #14958a; --coral: #d9465a; --crash: #d63030; --ok: #2f855a;
+    --scrim: 243,239,231; --glow: #fffaf0; --grain: .035; color-scheme: light;
+  } }
+  :root[data-theme="light"] {
+    --ink: #f3efe7; --ink-2: #fbf9f5; --ink-3: #e9e3d8; --rule: #d9d1c3;
+    --paper: #16181c; --paper-dim: #454a53; --muted: #7a7e86;
+    --amber: #d9860b; --teal: #14958a; --coral: #d9465a; --crash: #d63030; --ok: #2f855a;
+    --scrim: 243,239,231; --glow: #fffaf0; --grain: .035; color-scheme: light;
   }
   * { box-sizing: border-box; }
   html { scroll-behavior: smooth; }
-  body { margin: 0; background: var(--ink); color: var(--paper); font: 16px/1.6 var(--sans); -webkit-font-smoothing: antialiased; overflow-x: hidden; }
+  body { margin: 0; color: var(--paper); font: 16px/1.6 var(--sans); -webkit-font-smoothing: antialiased; overflow-x: hidden;
+         background: radial-gradient(90% 70% at 72% 40%, var(--glow) 0%, var(--ink) 65%) fixed, var(--ink);
+         transition: background-color .4s, color .4s; }
+  /* the live 3D scene sits behind everything; content stacks above it */
+  #bg3d { position: fixed; inset: 0; z-index: 0; transition: opacity .3s linear; }
+  #bg3d canvas { display: block; }
+  main, footer { position: relative; z-index: 1; }
+  .theme { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--rule); background: rgba(var(--scrim),.6);
+           color: var(--paper); cursor: pointer; padding: 0; transition: border-color .2s, transform .3s; }
+  .theme:hover { border-color: var(--paper-dim); transform: rotate(-15deg); }
+  .theme svg { width: 16px; height: 16px; }
+  .theme .sun { display: none; }
+  :root[data-theme="light"] .theme .sun { display: block; } :root[data-theme="light"] .theme .moon { display: none; }
   a { color: inherit; }
-  body::after { content: ""; position: fixed; inset: -50%; pointer-events: none; z-index: 50; opacity: .05;
+  body::after { content: ""; position: fixed; inset: -50%; pointer-events: none; z-index: 50; opacity: var(--grain);
     background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
     animation: grain 1.2s steps(6) infinite; }
   @keyframes grain { 0%{transform:translate(0,0)} 33%{transform:translate(-3%,2%)} 66%{transform:translate(2%,-3%)} 100%{transform:translate(0,0)} }
@@ -28,7 +65,7 @@
   .eyebrow { font: 500 12px/1 var(--mono); letter-spacing: .18em; text-transform: uppercase; color: var(--muted); }
 
   .bar { position: fixed; inset: 0 0 auto 0; z-index: 20; display: flex; justify-content: space-between; align-items: center;
-         padding: 18px var(--gutter) 26px; background: linear-gradient(to bottom, rgba(10,12,15,.92), rgba(10,12,15,0)); }
+         padding: 18px var(--gutter) 26px; background: linear-gradient(to bottom, rgba(var(--scrim),.92), rgba(var(--scrim),0)); }
   .mark { font: 500 14px/1 var(--mono); text-decoration: none; display: flex; gap: 10px; align-items: center; }
   .mark i { width: 9px; height: 9px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 12px var(--amber); animation: beat 1.4s ease-in-out infinite; }
   @keyframes beat { 0%,100%{opacity:.35} 12%{opacity:1} }
@@ -41,15 +78,13 @@
   .btn { font: 500 14px/1 var(--mono); padding: 15px 20px; border: 1px solid var(--rule); color: var(--paper); text-decoration: none;
          display: inline-flex; gap: 10px; align-items: center; transition: transform .2s, border-color .2s, background .2s; }
   .btn:hover { transform: translateY(-1px); border-color: var(--paper-dim); }
-  .btn.primary { background: var(--amber); border-color: var(--amber); color: var(--ink); }
-  .btn.primary:hover { background: #ffc46a; }
+  .btn.primary { background: var(--amber); border-color: var(--amber); color: var(--on-accent); }
+  .btn.primary:hover { filter: brightness(1.08); }
 
   /* hero */
-  .hero { position: relative; min-height: 100svh; display: grid; align-items: center; overflow: hidden;
-          background: radial-gradient(90% 70% at 70% 45%, #141a22 0%, var(--ink) 65%); }
-  #viz { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .hero { position: relative; min-height: 100svh; display: grid; align-items: center; overflow: hidden; }
   .hero::before { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
-                  background: linear-gradient(90deg, rgba(10,12,15,.95) 0%, rgba(10,12,15,.65) 38%, rgba(10,12,15,0) 62%); }
+                  background: linear-gradient(90deg, rgba(var(--scrim),.95) 0%, rgba(var(--scrim),.65) 38%, rgba(var(--scrim),0) 62%); }
   .hero .wrap { position: relative; z-index: 2; width: 100%; padding-top: 90px; padding-bottom: 60px; }
   h1 { font: 400 clamp(48px, 7vw, 100px)/.92 var(--serif); letter-spacing: -.02em; margin: 18px 0 0; max-width: 8.5em; }
   @media (min-width: 901px) { .hero .copy { max-width: 600px; } }
@@ -57,12 +92,12 @@
   .lede { max-width: 31em; color: var(--paper-dim); font-size: clamp(16px, 1.5vw, 19px); margin: 24px 0 32px; }
   .cta { display: flex; flex-wrap: wrap; gap: 12px; }
   .tags { margin-top: 30px; display: flex; flex-wrap: wrap; gap: 8px; font: 400 12px/1 var(--mono); color: var(--muted); }
-  .tags span { border: 1px solid var(--rule); padding: 7px 9px; background: rgba(10,12,15,.6); }
+  .tags span { border: 1px solid var(--rule); padding: 7px 9px; background: rgba(var(--scrim),.6); }
   .vizcap { position: absolute; z-index: 2; right: var(--gutter); bottom: 22px; font: 400 12px/1.5 var(--mono); color: var(--muted); text-align: right; }
   .vizcap b { color: var(--paper-dim); font-weight: 500; }
   @media (max-width: 900px) {
     .hero { align-items: start; }
-    .hero::before { background: linear-gradient(180deg, rgba(10,12,15,.95) 0%, rgba(10,12,15,.8) 50%, rgba(10,12,15,.1) 78%); }
+    .hero::before { background: linear-gradient(180deg, rgba(var(--scrim),.95) 0%, rgba(var(--scrim),.8) 50%, rgba(var(--scrim),.1) 78%); }
     .hero .wrap { padding-bottom: 300px; }
     .vizcap { left: var(--gutter); text-align: left; }
   }
@@ -132,18 +167,23 @@
 </style>
 </head>
 <body>
+<div id="bg3d" aria-hidden="true"></div>
 <header class="bar">
   <a class="mark" href="#top"><i></i>raftkv</a>
   <nav>
     <a class="hide-sm" href="#how">how it works</a>
     <a class="hide-sm" href="#proof">proof</a>
     <a class="hide-sm" href="https://github.com/Prathamesh250205/raftkv">github &#8599;</a>
+    <button class="theme" id="theme" type="button" aria-label="Switch to light mode">
+      <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"/></svg>
+      <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+    </button>
     <a class="go" href="demo/">live demo</a>
   </nav>
 </header>
 
+<main>
 <section class="hero" id="top">
-  <canvas id="viz" aria-hidden="true"></canvas>
   <div class="wrap"><div class="copy">
     <div class="eyebrow">Distributed systems &middot; built from scratch in Go</div>
     <h1>A database that <em>survives crashes.</em></h1>
@@ -282,6 +322,8 @@
   </div>
 </section>
 
+</main>
+
 <footer>
   <div class="wrap">
     <div><b>raftkv</b><br>by Prathamesh Gulavani</div>
@@ -290,78 +332,211 @@
 </footer>
 
 <script>
-// Hero illustration: three nodes on a 2D canvas. The leader sends heartbeats,
-// crashes, the others hold an election, and the crashed node comes back.
+// Theme toggle. With no saved choice the page follows the system setting.
 (() => {
-  const canvas = document.getElementById("viz"), ctx = canvas.getContext("2d");
-  const cap = document.getElementById("vizcap");
-  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const C = { amber: "#ffb547", teal: "#4fd1c5", coral: "#ff7a85", crash: "#ff4d4d", node: "#dfe7f2", line: "#232832" };
-  let W, H, dpr, nodes = [], pulses = [], ripples = [];
-
-  function layout() {
-    dpr = Math.min(devicePixelRatio, 2);
-    W = canvas.clientWidth; H = canvas.clientHeight;
-    canvas.width = W * dpr; canvas.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const wide = W > 900;
-    const cx = wide ? W * 0.76 : W * 0.5, cy = wide ? H * 0.56 : H - 170, r = wide ? Math.min(W * 0.16, H * 0.22) : 110;
-    nodes = [0, 1, 2].map((i) => {
-      const a = -Math.PI / 2 + i * 2 * Math.PI / 3;
-      return Object.assign(nodes[i] || { up: true }, { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r, id: i + 1 });
-    });
-  }
-  addEventListener("resize", layout); layout();
-
-  let leader = 0, phase = "steady", phaseAt = performance.now(), lastBeat = 0, round = 0;
-  const say = (t) => { cap.innerHTML = "<b>Illustration:</b> " + t; };
-
-  function step(now) {
-    const t = now - phaseAt;
-    if (phase === "steady" && t > 5200) { nodes[leader].up = false; ripples.push({ x: nodes[leader].x, y: nodes[leader].y, c: C.crash, t0: now, max: 160 }); phase = "silent"; phaseAt = now; say("the leader crashes; followers stop hearing heartbeats"); }
-    else if (phase === "silent" && t > 1300) {
-      const next = [0, 1, 2].find((i) => i !== leader && nodes[i].up);
-      for (const i of [0, 1, 2]) if (i !== next && nodes[i].up) pulses.push({ a: next, b: i, t0: now, c: C.teal, vote: true });
-      phase = "voting"; phaseAt = now; say(`node ${next + 1} asks for votes (term ${round + 2})`); nodes.cand = next;
-    }
-    else if (phase === "voting" && t > 900) { const old = leader; leader = nodes.cand; round++; ripples.push({ x: nodes[leader].x, y: nodes[leader].y, c: C.amber, t0: now, max: 130 }); phase = "recovering"; phaseAt = now; say(`node ${leader + 1} wins with 2 of 3 votes and keeps serving writes`); nodes.down = old; }
-    else if (phase === "recovering" && t > 3200) { nodes[nodes.down].up = true; ripples.push({ x: nodes[nodes.down].x, y: nodes[nodes.down].y, c: C.node, t0: now, max: 110 }); phase = "steady"; phaseAt = now; say(`node ${nodes.down + 1} restarts from disk and catches up`); }
-
-    if ((phase === "steady" || phase === "recovering") && now - lastBeat > 650) {
-      lastBeat = now;
-      for (const i of [0, 1, 2]) if (i !== leader && nodes[i].up) pulses.push({ a: leader, b: i, t0: now, c: C.amber });
-    }
-
-    ctx.clearRect(0, 0, W, H);
-    // links
-    ctx.strokeStyle = C.line; ctx.lineWidth = 1;
-    for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) { ctx.beginPath(); ctx.moveTo(nodes[i].x, nodes[i].y); ctx.lineTo(nodes[j].x, nodes[j].y); ctx.stroke(); }
-    // ripples
-    ripples = ripples.filter((r) => { const p = (now - r.t0) / 1400; if (p >= 1) return false;
-      ctx.strokeStyle = r.c; ctx.globalAlpha = (1 - p) * .8; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(r.x, r.y, 20 + p * r.max, 0, Math.PI * 2); ctx.stroke(); ctx.globalAlpha = 1; return true; });
-    // pulses
-    pulses = pulses.filter((p) => { const k = (now - p.t0) / (p.vote ? 700 : 900); if (k >= 1) return false;
-      const a = nodes[p.a], b = nodes[p.b], x = a.x + (b.x - a.x) * k, y = a.y + (b.y - a.y) * k;
-      ctx.shadowColor = p.c; ctx.shadowBlur = 14; ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(x, y, p.vote ? 5 : 3.5, 0, Math.PI * 2); ctx.fill(); ctx.shadowBlur = 0; return true; });
-    // nodes
-    nodes.forEach((n, i) => {
-      const isLead = n.up && i === leader && phase !== "silent" && phase !== "voting";
-      const col = !n.up ? C.crash : isLead ? C.amber : C.node;
-      const r = isLead ? 20 : 15;
-      ctx.shadowColor = col; ctx.shadowBlur = n.up ? (isLead ? 34 : 16) : 6;
-      ctx.fillStyle = n.up ? "#0f1318" : "#1a0d0d"; ctx.strokeStyle = col; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0;
-      if (isLead) { ctx.globalAlpha = .35 + .25 * Math.sin(now / 300); ctx.beginPath(); ctx.arc(n.x, n.y, r + 9, 0, Math.PI * 2); ctx.stroke(); ctx.globalAlpha = 1; }
-      ctx.fillStyle = !n.up ? C.crash : "#a9adb5"; ctx.font = "500 11px 'IBM Plex Mono', monospace"; ctx.textAlign = "center";
-      ctx.fillText(`NODE ${n.id}${!n.up ? " · DOWN" : isLead ? " · LEADER" : ""}`, n.x, n.y + r + 24);
-    });
-    if (!reduce) requestAnimationFrame(step);
-  }
-  requestAnimationFrame(step);
+  const btn = document.getElementById("theme"), root = document.documentElement;
+  const system = () => (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+  let saved = null;
+  try { saved = localStorage.getItem("raftkv-theme"); } catch (_) {}
+  const set = (t) => {
+    root.dataset.theme = t;
+    btn.setAttribute("aria-label", t === "dark" ? "Switch to light mode" : "Switch to dark mode");
+    dispatchEvent(new Event("themechange"));
+  };
+  set(saved || system());
+  btn.addEventListener("click", () => {
+    const next = root.dataset.theme === "dark" ? "light" : "dark";
+    try { localStorage.setItem("raftkv-theme", next); saved = next; } catch (_) {}
+    set(next);
+  });
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { if (!saved) set(system()); });
 })();
 
-// scroll reveals
+// Scroll reveals.
 const io = new IntersectionObserver((es) => es.forEach((e) => { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } }), { threshold: .15 });
 document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+</script>
+
+<script type="module">
+// Live 3D background: three nodes, each with one ring per shard. The leader
+// sends heartbeats, then crashes; the others vote in a new leader and the
+// crashed node recovers. The caption in the hero narrates each step.
+const host = document.getElementById("bg3d"), cap = document.getElementById("vizcap");
+const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+try {
+  const THREE = await import("three");
+  const { EffectComposer } = await import("three/addons/postprocessing/EffectComposer.js");
+  const { RenderPass } = await import("three/addons/postprocessing/RenderPass.js");
+  const { UnrealBloomPass } = await import("three/addons/postprocessing/UnrealBloomPass.js");
+  const { OutputPass } = await import("three/addons/postprocessing/OutputPass.js");
+
+  const PALETTE = {
+    dark:  { fog: 0x0a0c0f, floor: 0x3a4250, dots: 0x2b313b, link: 0x2c333e, core: 0x14181e, emissive: 0xdfe7f2, glow: 0.34, shell: 0x9fb0c8,
+             shards: [0xffb547, 0x4fd1c5, 0xff7a85], crash: 0xff4d4d, dust: 0x8a94a6, bloom: true },
+    light: { fog: 0xf3efe7, floor: 0xc9c0b0, dots: 0xd2cabd, link: 0xc4baa9, core: 0x2a2f37, emissive: 0x000000, glow: 0, shell: 0x6b7280,
+             shards: [0xd9860b, 0x14958a, 0xd9465a], crash: 0xd63030, dust: 0xb9b0a1, bloom: false },
+  };
+  const theme = () => (document.documentElement.dataset.theme === "light" ? PALETTE.light : PALETTE.dark);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setClearColor(0x000000, 0);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  host.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x0a0c0f, 0.05);
+  const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 100);
+  scene.add(new THREE.AmbientLight(0x9aa6b8, 0.6));
+  const key = new THREE.PointLight(0xffe2b8, 22, 30); key.position.set(3, 6, 4); scene.add(key);
+  const rim = new THREE.PointLight(0x4fd1c5, 10, 30); rim.position.set(-5, 2, -4); scene.add(rim);
+
+  const floorY = -1.35, floor = new THREE.Group(); floor.position.y = floorY; scene.add(floor);
+  const floorRings = [];
+  for (let r = 1; r <= 7; r++) {
+    const m = new THREE.Mesh(new THREE.RingGeometry(r * .95, r * .95 + .006, 128), new THREE.MeshBasicMaterial({ transparent: true, opacity: .55 - r * .06, side: THREE.DoubleSide }));
+    m.rotation.x = -Math.PI / 2; floor.add(m); floorRings.push(m);
+  }
+  const dotPts = [];
+  for (let x = -14; x <= 14; x++) for (let z = -14; z <= 14; z++) if (x * x + z * z < 196) dotPts.push(x * .5, 0, z * .5);
+  const dotGeo = new THREE.BufferGeometry(); dotGeo.setAttribute("position", new THREE.Float32BufferAttribute(dotPts, 3));
+  const dots = new THREE.Points(dotGeo, new THREE.PointsMaterial({ size: .025 })); floor.add(dots);
+  const dust = (() => {
+    const n = 380, pos = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) { pos[i * 3] = (Math.random() - .5) * 22; pos[i * 3 + 1] = Math.random() * 7 - 1.5; pos[i * 3 + 2] = (Math.random() - .5) * 22; }
+    const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    const p = new THREE.Points(g, new THREE.PointsMaterial({ size: .02, transparent: true, opacity: .55 })); scene.add(p); return p;
+  })();
+
+  const R = 2.55;
+  const nodes = [0, 1, 2].map((i) => {
+    const a = -Math.PI / 2 + i * 2 * Math.PI / 3 + Math.PI;
+    const pos = new THREE.Vector3(Math.cos(a) * R, 0, Math.sin(a) * R);
+    const group = new THREE.Group(); group.position.copy(pos); scene.add(group);
+    const coreMat = new THREE.MeshStandardMaterial({ roughness: .35, metalness: .6 });
+    group.add(new THREE.Mesh(new THREE.IcosahedronGeometry(.4, 4), coreMat));
+    const shell = new THREE.Mesh(new THREE.IcosahedronGeometry(.47, 1), new THREE.MeshBasicMaterial({ wireframe: true, transparent: true, opacity: .14 }));
+    group.add(shell);
+    const rings = [0, 1, 2].map((s) => {
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(.72 + s * .17, s ? .012 : .016, 12, 160), new THREE.MeshBasicMaterial({ transparent: true, opacity: .18 }));
+      ring.rotation.set(Math.PI / 2 + (s - 1) * .55, s * .9, 0); group.add(ring); return ring;
+    });
+    return { pos, group, coreMat, shell, rings, up: true, wobble: Math.random() * 6 };
+  });
+  const linkMat = new THREE.LineBasicMaterial({ transparent: true, opacity: .9 });
+  const curve = (a, b) => { const m = a.clone().add(b).multiplyScalar(.5); m.y += .55; return new THREE.QuadraticBezierCurve3(a, m, b); };
+  for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(curve(nodes[i].pos, nodes[j].pos).getPoints(24)), linkMat));
+
+  // effects: packets travel along links, ripples spread on the floor, crashes burst
+  const fx = [], ball = new THREE.SphereGeometry(1, 12, 12);
+  function packet(a, b, color, size, dur) {
+    const c = curve(nodes[a].pos, nodes[b].pos), m = new THREE.Mesh(ball, new THREE.MeshBasicMaterial({ color, transparent: true }));
+    m.scale.setScalar(size); scene.add(m);
+    fx.push({ t: 0, dur, update(t) { m.position.copy(c.getPoint(t)); m.material.opacity = t < .85 ? 1 : (1 - t) / .15; }, done() { scene.remove(m); m.material.dispose(); } });
+  }
+  function ripple(i, color, max = 3, dur = 1.5) {
+    const m = new THREE.Mesh(new THREE.RingGeometry(.98, 1, 96), new THREE.MeshBasicMaterial({ color, transparent: true, side: THREE.DoubleSide }));
+    m.rotation.x = -Math.PI / 2; m.position.copy(nodes[i].pos); m.position.y = floorY + .01; scene.add(m);
+    fx.push({ t: 0, dur, update(t) { m.scale.setScalar(.4 + (1 - Math.pow(1 - t, 3)) * max); m.material.opacity = (1 - t) * .9; }, done() { scene.remove(m); m.geometry.dispose(); m.material.dispose(); } });
+  }
+  function burst(i, color) {
+    const n = 220, pos = new Float32Array(n * 3), vel = Array.from({ length: n }, () => new THREE.Vector3().randomDirection().multiplyScalar(.8 + Math.random() * 2.4));
+    const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    const p = new THREE.Points(g, new THREE.PointsMaterial({ color, size: .05, transparent: true })); p.position.copy(nodes[i].pos); scene.add(p);
+    fx.push({ t: 0, dur: 1.5, update(t) { const e = 1 - Math.pow(1 - t, 2);
+        for (let k = 0; k < n; k++) { pos[k * 3] = vel[k].x * e; pos[k * 3 + 1] = vel[k].y * e - t * t * .9; pos[k * 3 + 2] = vel[k].z * e; }
+        g.attributes.position.needsUpdate = true; p.material.opacity = 1 - t; }, done() { scene.remove(p); g.dispose(); p.material.dispose(); } });
+  }
+
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), .7, .45, .2); composer.addPass(bloom);
+  composer.addPass(new OutputPass());
+
+  // colours follow the page theme
+  let P;
+  function applyTheme() {
+    P = theme();
+    scene.fog.color.setHex(P.fog);
+    floorRings.forEach((m) => m.material.color.setHex(P.floor));
+    dots.material.color.setHex(P.dots); dust.material.color.setHex(P.dust); linkMat.color.setHex(P.link);
+    nodes.forEach((n) => { n.shell.material.color.setHex(P.shell); n.rings.forEach((r, s) => r.material.color.setHex(P.shards[s])); paintNode(n); });
+  }
+  function paintNode(n) {
+    n.coreMat.color.setHex(n.up ? P.core : P.crash === 0xd63030 ? 0x5a1d1d : 0x14181e);
+    n.coreMat.emissive.setHex(n.up ? P.emissive : P.crash);
+    n.coreMat.emissiveIntensity = n.up ? P.glow : (P.bloom ? .5 : .15);
+  }
+  addEventListener("themechange", applyTheme); applyTheme();
+
+  function resize() {
+    const w = innerWidth, h = innerHeight;
+    renderer.setSize(w, h); composer.setSize(w, h);
+    camera.aspect = w / h; camera.fov = w < 700 ? 50 : 36;
+    if (w > 900) camera.setViewOffset(w, h, -w * .24, -h * .02, w, h); else camera.setViewOffset(w, h, 0, -h * .27, w, h);
+    camera.updateProjectionMatrix();
+  }
+  addEventListener("resize", resize); resize();
+
+  // the story, on a loop
+  let leader = 0, phase = "steady", phaseAt = performance.now(), lastBeat = 0, cand = 1, down = 0, term = 1;
+  const say = (t) => { cap.innerHTML = "<b>Live:</b> " + t; };
+  const setLeaderRings = () => nodes.forEach((n, i) => n.rings.forEach((r) => { r.material.opacity = !n.up ? 0 : (i === leader && phase !== "silent" && phase !== "voting") ? 1 : .16; }));
+  say("node 1 leads and sends heartbeats to the others");
+  function story(now) {
+    const t = now - phaseAt;
+    if (phase === "steady" && t > 5200) {
+      down = leader; nodes[down].up = false; paintNode(nodes[down]); burst(down, P.crash); ripple(down, P.crash, 4, 1.8);
+      phase = "silent"; phaseAt = now; say(`node ${down + 1} crashes; the others stop hearing heartbeats`);
+    } else if (phase === "silent" && t > 1300) {
+      cand = [0, 1, 2].find((i) => i !== down);
+      for (const i of [0, 1, 2]) if (i !== cand && nodes[i].up) packet(cand, i, P.shards[1], .06, .6);
+      term++; phase = "voting"; phaseAt = now; say(`node ${cand + 1} asks for votes in term ${term}`);
+    } else if (phase === "voting" && t > 900) {
+      leader = cand; ripple(leader, P.shards[0], 3, 1.5);
+      phase = "recovering"; phaseAt = now; say(`node ${leader + 1} wins 2 of 3 votes and keeps serving writes`);
+    } else if (phase === "recovering" && t > 3400) {
+      nodes[down].up = true; paintNode(nodes[down]); ripple(down, P.shards[1], 3, 1.4);
+      phase = "steady"; phaseAt = now; say(`node ${down + 1} restarts from its log on disk and catches up`);
+    }
+    if ((phase === "steady" || phase === "recovering") && now - lastBeat > 700) {
+      lastBeat = now;
+      for (const i of [0, 1, 2]) if (i !== leader && nodes[i].up) packet(leader, i, P.shards[0], .03, .9);
+    }
+    setLeaderRings();
+  }
+
+  // camera: slow orbit, mouse parallax, and a drift as the page scrolls
+  const mouse = new THREE.Vector2(), aim = new THREE.Vector2();
+  addEventListener("pointermove", (e) => mouse.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1));
+  let theta = .35, last = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, .05); last = now;
+    const s = Math.min(scrollY / innerHeight, 3);
+    host.style.opacity = Math.max(.2, 1 - s * .8).toFixed(3);
+    if (!reduce) { theta += dt * .05; story(now); }
+    aim.lerp(mouse, .04);
+    const radius = (innerWidth < 700 ? 19 : 11.2) + s * 1.2, height = (innerWidth < 700 ? 6.5 : 4.3) + s * 1.4;
+    camera.position.set(Math.sin(theta + s * .5 + aim.x * .25) * radius, height + aim.y * .7, Math.cos(theta + s * .5 + aim.x * .25) * radius);
+    camera.lookAt(0, -.15, 0);
+    for (const n of nodes) {
+      n.wobble += dt; n.group.position.y = n.up ? Math.sin(n.wobble * 1.3) * .07 : -.25;
+      n.rings.forEach((r, k) => { r.rotation.z += dt * (.25 + k * .12) * (k % 2 ? -1 : 1); });
+      n.shell.rotation.y += dt * .2;
+      if (!n.up && P.bloom) n.coreMat.emissiveIntensity = .08 + (Math.random() < .06 ? .5 : 0);
+    }
+    dust.rotation.y += dt * .01;
+    for (let i = fx.length - 1; i >= 0; i--) { const f = fx[i]; f.t += dt / f.dur; if (f.t >= 1) { f.update(1); f.done(); fx.splice(i, 1); } else f.update(f.t); }
+    if (P.bloom) composer.render(); else renderer.render(scene, camera);
+    if (!reduce) requestAnimationFrame(frame);
+  }
+  setLeaderRings();
+  requestAnimationFrame(frame);
+  if (reduce) addEventListener("scroll", () => requestAnimationFrame(frame), { passive: true });
+} catch (e) {
+  console.warn("3D background unavailable:", e);
+  cap.hidden = true;
+}
 </script>
 </body>
 </html>

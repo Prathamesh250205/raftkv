@@ -6,103 +6,386 @@
 <!-- "server": talk to cmd/kvdemo over HTTP. "wasm": run the cluster in this
      page (cmd/kvwasm); the GitHub Pages build switches this to wasm. -->
 <meta name="raftkv-mode" content="server">
-<title>raftkv live demo</title>
+<title>raftkv: consensus you can break</title>
+<meta name="description" content="A live, sharded Raft cluster running in your browser. Crash a node and watch the others elect a new leader without losing data.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
 <style>
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --text: #16181d; --muted: #5f6672; --line: #e3e6eb;
-    --accent: #2f6fed; --leader: #b7791f; --leader-bg: #fdf3e1; --follower-bg: #eef2f8;
-    --down: #9aa1ab; --down-bg: #f1f2f4; --danger: #c53030; --ok: #2f855a;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f1115; --panel: #171a21; --text: #e7e9ee; --muted: #9aa3b2; --line: #272c36;
-      --accent: #6b9bff; --leader: #f0b452; --leader-bg: #2e2412; --follower-bg: #1d2533;
-      --down: #6b7280; --down-bg: #1c1f26; --danger: #fc8181; --ok: #68d391;
-    }
+    --ink: #0a0c0f;
+    --ink-2: #101318;
+    --ink-3: #161a21;
+    --rule: #232832;
+    --paper: #ece8e1;
+    --paper-dim: #a9adb5;
+    --muted: #6d727c;
+    --shard-0: #ffb547;   /* amber */
+    --shard-1: #4fd1c5;   /* teal */
+    --shard-2: #ff7a85;   /* coral */
+    --crash: #ff4d4d;
+    --ok: #7ee2a8;
+    --serif: "Instrument Serif", Georgia, serif;
+    --sans: "IBM Plex Sans", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+    --gutter: clamp(16px, 4vw, 48px);
+    --max: 1180px;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  main { max-width: 1040px; margin: 0 auto; padding: 28px 16px 48px; }
-  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.01em; }
-  h2 { font-size: 15px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
-  p.lede { margin: 0 0 4px; color: var(--muted); max-width: 760px; }
-  a { color: var(--accent); }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
-  .nodes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 22px 0; }
-  .node.down { opacity: 0.7; }
-  .node header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-  .node h3 { margin: 0; font-size: 17px; }
-  .pill { font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 99px; }
-  .pill.up { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
-  .pill.down { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  td { padding: 6px 0; border-top: 1px solid var(--line); }
-  td.num { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .role { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 6px; }
-  .role.leader { color: var(--leader); background: var(--leader-bg); }
-  .role.follower { color: var(--muted); background: var(--follower-bg); }
-  .role.candidate { color: var(--accent); background: var(--follower-bg); }
-  .role.down { color: var(--down); background: var(--down-bg); }
-  button { font: inherit; font-weight: 600; border-radius: 8px; border: 1px solid var(--line);
-           background: var(--panel); color: var(--text); padding: 7px 14px; cursor: pointer; }
-  button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); width: 100%; margin-top: 12px; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button:disabled { opacity: 0.45; cursor: not-allowed; }
-  .row { display: grid; grid-template-columns: 1.1fr 1fr; gap: 14px; }
-  .kv form { display: flex; flex-wrap: wrap; gap: 8px; }
-  input { font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
-          background: var(--bg); color: var(--text); min-width: 0; flex: 1 1 140px; }
-  #result { margin-top: 12px; min-height: 22px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 14px; word-break: break-word; }
-  .events ol { list-style: none; margin: 0; padding: 0; max-height: 310px; overflow: auto; font-size: 14px; }
-  .events li { padding: 6px 0; border-top: 1px solid var(--line); }
-  .events time { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 8px; }
-  .hint { color: var(--muted); font-size: 13px; margin-top: 10px; }
-  #error { color: var(--danger); font-size: 14px; min-height: 20px; margin-top: 8px; }
-  footer { margin-top: 26px; color: var(--muted); font-size: 13px; }
-  @media (max-width: 760px) { .nodes, .row { grid-template-columns: 1fr; } }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--ink); color: var(--paper); font: 16px/1.6 var(--sans); -webkit-font-smoothing: antialiased; overflow-x: hidden; }
+  a { color: inherit; }
+  ::selection { background: var(--shard-0); color: var(--ink); }
+
+  /* film grain over everything, very subtle */
+  body::after {
+    content: ""; position: fixed; inset: -50%; pointer-events: none; z-index: 50; opacity: .05;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    animation: grain 1.2s steps(6) infinite;
+  }
+  @keyframes grain { 0%{transform:translate(0,0)} 25%{transform:translate(-3%,2%)} 50%{transform:translate(2%,-3%)} 75%{transform:translate(-2%,-1%)} 100%{transform:translate(0,0)} }
+
+  .wrap { max-width: var(--max); margin: 0 auto; padding: 0 var(--gutter); }
+  .eyebrow { font: 500 12px/1 var(--mono); letter-spacing: .18em; text-transform: uppercase; color: var(--muted); }
+  .eyebrow b { color: var(--paper); font-weight: 500; }
+
+  /* ---------- top bar ---------- */
+  .bar { position: fixed; top: 0; left: 0; right: 0; z-index: 20; display: flex; align-items: center; justify-content: space-between;
+         padding: 18px var(--gutter) 26px; pointer-events: none;
+         background: linear-gradient(to bottom, rgba(10,12,15,.92) 0%, rgba(10,12,15,.6) 60%, rgba(10,12,15,0) 100%); }
+  .bar > * { pointer-events: auto; }
+  .mark { font: 500 14px/1 var(--mono); letter-spacing: .04em; text-decoration: none; display: flex; align-items: center; gap: 10px; }
+  .mark i { width: 9px; height: 9px; border-radius: 50%; background: var(--shard-0); box-shadow: 0 0 12px var(--shard-0); animation: beat 1.4s ease-in-out infinite; }
+  @keyframes beat { 0%,100%{opacity:.35} 12%{opacity:1} }
+  .bar nav { display: flex; gap: 22px; font: 400 13px/1 var(--mono); }
+  .bar nav a { text-decoration: none; color: var(--paper-dim); transition: color .2s; }
+  .bar nav a:hover { color: var(--paper); }
+  @media (max-width: 640px) { .bar nav a:not(.gh) { display: none; } }
+
+  /* ---------- hero ---------- */
+  .stage { display: none; }
+  @media (max-width: 900px) { .stage { display: block; min-height: 400px; } .nlabel { font-size: 10px; } }
+  .hero { position: relative; min-height: 100svh; display: grid; grid-template-rows: 1fr auto auto; overflow: hidden;
+          background: radial-gradient(120% 80% at 50% 38%, #141920 0%, var(--ink) 62%); }
+  #scene { position: absolute; inset: 0; }
+  /* keeps the copy readable over the scene: dark on the left (desktop) or top (phone) */
+  .hero::before { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+                  background: linear-gradient(90deg, rgba(10,12,15,.92) 0%, rgba(10,12,15,.7) 32%, rgba(10,12,15,0) 58%); }
+  @media (max-width: 900px) { .hero::before { background: linear-gradient(180deg, rgba(10,12,15,.94) 0%, rgba(10,12,15,.75) 44%, rgba(10,12,15,0) 66%); } }
+  #scene canvas { display: block; }
+  .labels { position: absolute; inset: 0; pointer-events: none; z-index: 1; }
+  .hero-copy { position: relative; z-index: 2; padding: 112px var(--gutter) 0; max-width: var(--max); width: 100%; margin: 0 auto; pointer-events: none; }
+  .hero-copy > * { pointer-events: auto; }
+  h1 { font: 400 clamp(46px, 8.4vw, 116px)/.92 var(--serif); letter-spacing: -.02em; margin: 18px 0 0; max-width: 9.5em; }
+  h1 em { font-style: italic; color: var(--shard-0); }
+  .lede { max-width: 33em; color: var(--paper-dim); font-size: clamp(15px, 1.4vw, 18px); margin: 22px 0 28px; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn { font: 500 14px/1 var(--mono); letter-spacing: .02em; padding: 14px 18px; border-radius: 2px; border: 1px solid var(--rule);
+         background: rgba(10,12,15,.55); color: var(--paper); cursor: pointer; text-decoration: none; display: inline-flex; gap: 10px; align-items: center;
+         backdrop-filter: blur(6px); transition: border-color .2s, transform .2s, background .2s; }
+  .btn:hover { border-color: var(--paper-dim); transform: translateY(-1px); }
+  .btn.hot { border-color: color-mix(in srgb, var(--crash) 60%, transparent); color: #ffd9d9; }
+  .btn.hot:hover { background: color-mix(in srgb, var(--crash) 16%, transparent); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+  .btn kbd { font: inherit; color: var(--muted); }
+  .hint { font: 400 12px/1.5 var(--mono); color: var(--muted); margin-top: 14px; }
+
+  .hud { position: relative; z-index: 2; border-top: 1px solid var(--rule); background: linear-gradient(to top, rgba(10,12,15,.92), rgba(10,12,15,.6));
+         backdrop-filter: blur(8px); }
+  .hud .wrap { display: grid; grid-template-columns: repeat(4, 1fr); }
+  .hud div.stat { padding: 18px 0; border-left: 1px solid var(--rule); padding-left: 18px; }
+  .hud div.stat:first-child { border-left: 0; padding-left: 0; }
+  .stat .k { font: 500 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+  .stat .v { font: 400 30px/1.15 var(--serif); margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .stat .v small { font: 400 13px var(--mono); color: var(--muted); margin-left: 4px; }
+  @media (max-width: 760px) { .hud .wrap { grid-template-columns: repeat(2, 1fr); } .hud div.stat:nth-child(3) { border-left: 0; padding-left: 0; } }
+
+  /* node labels drawn over the 3D scene */
+  .nlabel { font: 500 11px/1.35 var(--mono); letter-spacing: .08em; color: var(--paper); text-transform: uppercase; text-align: center;
+            white-space: nowrap; text-shadow: 0 0 12px var(--ink); }
+  .nlabel .roles { display: flex; gap: 4px; justify-content: center; margin-top: 5px; }
+  .nlabel .roles span { padding: 2px 5px; border: 1px solid var(--rule); color: var(--muted); background: rgba(10,12,15,.7); }
+  .nlabel .roles span.lead { color: var(--ink); border-color: transparent; }
+  .nlabel .down { color: var(--crash); margin-top: 5px; }
+
+  /* ---------- sections ---------- */
+  section.block { padding: clamp(80px, 12vw, 150px) 0; border-top: 1px solid var(--rule); }
+  .head { display: grid; grid-template-columns: 1fr 1.25fr; gap: 40px; align-items: end; margin-bottom: 56px; }
+  h2 { font: 400 clamp(36px, 5vw, 64px)/1 var(--serif); letter-spacing: -.015em; margin: 14px 0 0; }
+  h2 em { font-style: italic; color: var(--paper-dim); }
+  .head p { color: var(--paper-dim); margin: 0; max-width: 34em; }
+  @media (max-width: 820px) { .head { grid-template-columns: 1fr; gap: 18px; } }
+
+  .reveal { opacity: 0; transform: translateY(26px); transition: opacity .9s cubic-bezier(.2,.7,.2,1), transform .9s cubic-bezier(.2,.7,.2,1); }
+  .reveal.in { opacity: 1; transform: none; }
+
+  /* console */
+  .console { display: grid; grid-template-columns: 1fr 1.15fr; gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+  .console > div { background: var(--ink-2); padding: 28px; }
+  @media (max-width: 900px) { .console { grid-template-columns: 1fr; } }
+  .field { display: grid; grid-template-columns: 70px 1fr; align-items: center; border-bottom: 1px solid var(--rule); }
+  .field label { font: 500 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+  .field input { background: transparent; border: 0; color: var(--paper); font: 400 16px/1 var(--mono); padding: 16px 0; outline: none; min-width: 0; }
+  .field:focus-within { border-color: var(--shard-0); }
+  .actions { display: flex; gap: 10px; margin-top: 22px; }
+  .actions .btn { flex: 1; justify-content: center; }
+  .actions .btn.primary { background: var(--paper); color: var(--ink); border-color: var(--paper); }
+  #result { margin-top: 22px; font: 400 14px/1.6 var(--mono); min-height: 46px; color: var(--paper-dim); }
+  #result b { color: var(--paper); font-weight: 500; }
+  .route { margin-top: 18px; font: 400 12px/1.6 var(--mono); color: var(--muted); }
+  .route i { font-style: normal; padding: 1px 6px; color: var(--ink); }
+
+  table.cluster { width: 100%; border-collapse: collapse; margin-top: 30px; font: 400 13px/1 var(--mono); }
+  table.cluster th { text-align: left; font-weight: 500; color: var(--muted); letter-spacing: .1em; text-transform: uppercase; font-size: 11px; padding: 0 0 10px; }
+  table.cluster td { padding: 11px 0; border-top: 1px solid var(--rule); }
+  .role { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 8px; vertical-align: -1px; border: 1px solid var(--muted); }
+  .role.leader { border: 0; box-shadow: 0 0 10px currentColor; background: currentColor; }
+  .role.down { border-color: var(--crash); background: transparent; }
+  .crashbtn { font: 500 11px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; background: none; border: 1px solid var(--rule);
+              color: var(--paper-dim); padding: 7px 9px; cursor: pointer; }
+  .crashbtn:hover:not(:disabled) { color: #ffd9d9; border-color: var(--crash); }
+  .crashbtn:disabled { opacity: .35; cursor: not-allowed; }
+  #error { font: 400 12px/1.5 var(--mono); color: var(--crash); min-height: 20px; margin-top: 12px; }
+
+  .stream { font: 400 13px/1.55 var(--mono); height: 440px; overflow: auto; margin: 0; padding: 0; list-style: none; mask-image: linear-gradient(to bottom, #000 80%, transparent); }
+  .stream li { display: grid; grid-template-columns: 72px 1fr; gap: 14px; padding: 9px 0; border-top: 1px solid var(--rule); color: var(--paper-dim); }
+  .stream li.fresh { animation: slidein .5s ease both; }
+  .stream li time { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .stream li.crash { color: #ffc4c4; } .stream li.elect { color: var(--paper); } .stream li.up { color: var(--ok); }
+  @keyframes slidein { from { opacity: 0; transform: translateX(-8px); } }
+
+  /* steps */
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+  .step { background: var(--ink); padding: 28px 24px 30px; }
+  .step .n { font: 400 13px/1 var(--mono); color: var(--muted); }
+  .step h3 { font: 400 30px/1.05 var(--serif); margin: 18px 0 12px; }
+  .step p { color: var(--paper-dim); font-size: 14.5px; margin: 0; }
+  .step svg { width: 100%; height: 120px; margin-top: 8px; overflow: visible; }
+  @media (max-width: 980px) { .steps { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .steps { grid-template-columns: 1fr; } }
+
+  /* numbers */
+  .nums { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--rule); }
+  .num { padding: 34px 26px 6px 0; border-right: 1px solid var(--rule); }
+  .num:last-child { border-right: 0; }
+  .num .big { font: 400 clamp(52px, 6.4vw, 92px)/.9 var(--serif); letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .num .big sup { font: 400 .32em var(--mono); color: var(--muted); vertical-align: top; margin-left: 6px; }
+  .num .lbl { font: 500 11px/1.4 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin-top: 16px; }
+  .num p { color: var(--paper-dim); font-size: 14px; margin: 10px 0 0; max-width: 20em; }
+  .num + .num { padding-left: 26px; }
+  @media (max-width: 900px) { .nums { grid-template-columns: repeat(2, 1fr); } .num:nth-child(2) { border-right: 0; } .num:nth-child(3) { padding-left: 0; } }
+  .bars { margin-top: 64px; display: grid; gap: 14px; }
+  .barrow { display: grid; grid-template-columns: 230px 1fr 92px; gap: 18px; align-items: center; font: 400 13px/1.3 var(--mono); color: var(--paper-dim); }
+  .barrow .track { height: 6px; background: var(--ink-3); position: relative; overflow: hidden; }
+  .barrow .fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--paper-dim); transition: width 1.6s cubic-bezier(.2,.7,.2,1); }
+  .barrow.best .fill { background: var(--shard-0); box-shadow: 0 0 16px var(--shard-0); }
+  .barrow .val { text-align: right; color: var(--paper); font-variant-numeric: tabular-nums; }
+  @media (max-width: 640px) { .barrow { grid-template-columns: 1fr 70px; } .barrow .track { grid-column: 1 / -1; grid-row: 2; } }
+
+  /* code map */
+  .files { border-top: 1px solid var(--rule); }
+  .file { display: grid; grid-template-columns: 290px 1fr auto; gap: 28px; padding: 22px 0; border-bottom: 1px solid var(--rule); text-decoration: none; transition: padding .3s, background .3s; }
+  .file:hover { padding-left: 14px; background: linear-gradient(to right, var(--ink-2), transparent); }
+  .file code { font: 500 14px/1.5 var(--mono); color: var(--paper); }
+  .file span { color: var(--paper-dim); font-size: 15px; }
+  .file em { font: 400 12px/1.5 var(--mono); color: var(--muted); font-style: normal; }
+  @media (max-width: 760px) { .file { grid-template-columns: 1fr; gap: 6px; } }
+
+  footer { border-top: 1px solid var(--rule); padding: 56px 0 72px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 24px; justify-content: space-between; align-items: end; }
+  footer .sig { font: 400 clamp(32px, 4vw, 48px)/1 var(--serif); }
+  footer .sig em { color: var(--paper-dim); }
+  footer p { font: 400 13px/1.7 var(--mono); color: var(--muted); margin: 0; }
+
+  .noscene .hero { background: radial-gradient(90% 60% at 50% 40%, #18202a, var(--ink)); }
+  @media (prefers-reduced-motion: reduce) {
+    body::after, .mark i { animation: none; }
+    .reveal { transition: none; opacity: 1; transform: none; }
+    html { scroll-behavior: auto; }
+  }
 </style>
 </head>
 <body>
-<main>
-  <h1>raftkv: live demo</h1>
-  <p class="lede">A sharded key-value store built on a from-scratch implementation of the Raft consensus
-    algorithm. Three nodes each replicate three shards; every shard elects its own leader.
-    <b>Crash a node</b> and watch the surviving nodes elect a new leader, with no data lost.</p>
-  <p class="lede"><a href="https://github.com/Prathamesh250205/raftkv">Source code and design on GitHub</a></p>
+<header class="bar">
+  <a class="mark" href="#top"><i></i>raftkv</a>
+  <nav>
+    <a href="#console">console</a>
+    <a href="#how">how it works</a>
+    <a href="#numbers">numbers</a>
+    <a href="#code">code</a>
+    <a class="gh" href="https://github.com/Prathamesh250205/raftkv">github &#8599;</a>
+  </nav>
+</header>
 
-  <p class="lede" id="where"></p>
-  <section class="nodes" id="nodes" aria-live="polite"><p class="hint">Starting the cluster...</p></section>
-  <div id="error" role="alert"></div>
-
-  <div class="row">
-    <section class="panel kv">
-      <h2>Read and write</h2>
-      <form id="kvform">
-        <input id="key" placeholder="key" maxlength="64" value="greeting" aria-label="Key">
-        <input id="value" placeholder="value" maxlength="256" value="hello from the demo" aria-label="Value">
-        <button class="primary" type="submit" data-op="put">Put</button>
-        <button type="button" id="get">Get</button>
-      </form>
-      <div id="result"></div>
-      <p class="hint">Every write is committed by a majority of the shard's replicas before it is acknowledged,
-        so it survives a crash. Try: put a value, crash the node that leads its shard, then get it again.</p>
-    </section>
-    <section class="panel events">
-      <h2>What just happened</h2>
-      <ol id="events"></ol>
-    </section>
+<section class="hero" id="top">
+  <div id="scene" aria-hidden="true"></div>
+  <div class="labels" id="labels"></div>
+  <div class="hero-copy">
+    <div class="eyebrow"><b>Live cluster</b> &nbsp;/&nbsp; 3 nodes &middot; 3 shards &middot; <span id="where">connecting</span></div>
+    <h1>Consensus you can <em>break.</em></h1>
+    <p class="lede">raftkv is a sharded key-value store built on a from-scratch implementation of the Raft
+      consensus algorithm in Go. The cluster on this page is real. Crash any node and watch the others
+      elect a new leader, without losing a single committed write.</p>
+    <div class="cta">
+      <button class="btn hot" id="crashLeader" disabled>Crash the busiest leader</button>
+      <a class="btn" href="#console">Write a key <kbd>&darr;</kbd></a>
+    </div>
+    <div class="hint" id="sceneHint">Each ring is a shard. A bright ring means that node leads it. Click a node to crash it.</div>
   </div>
+  <div class="stage" id="stage" aria-hidden="true"></div>
+  <div class="hud">
+    <div class="wrap">
+      <div class="stat"><div class="k">Elections seen</div><div class="v" id="hElections">0</div></div>
+      <div class="stat"><div class="k">Last failover</div><div class="v" id="hFailover">&ndash;</div></div>
+      <div class="stat"><div class="k">Committed entries</div><div class="v" id="hCommits">0</div></div>
+      <div class="stat"><div class="k">Highest term</div><div class="v" id="hTerm">0</div></div>
+    </div>
+  </div>
+</section>
 
-  <footer>A sandbox: data resets when the demo restarts, only one node can be down at a time
-    (so a majority always survives), and a crashed node restarts from its saved state after 6 seconds.</footer>
-</main>
+<section class="block" id="console">
+  <div class="wrap">
+    <div class="head reveal">
+      <div><div class="eyebrow">01 &nbsp;/&nbsp; Console</div><h2>Write it. <em>Then try to lose it.</em></h2></div>
+      <p>Every write is routed to its shard's leader and acknowledged only after a majority of replicas
+        has it. Store a value, crash the node leading its shard, and read it back.</p>
+    </div>
+    <div class="console reveal">
+      <div>
+        <form id="kvform" autocomplete="off">
+          <div class="field"><label for="key">Key</label><input id="key" maxlength="64" value="greeting" spellcheck="false"></div>
+          <div class="field"><label for="value">Value</label><input id="value" maxlength="256" value="hello, consensus" spellcheck="false"></div>
+          <div class="actions">
+            <button class="btn primary" type="submit">Put</button>
+            <button class="btn" type="button" id="get">Get</button>
+          </div>
+        </form>
+        <div id="result" aria-live="polite">Waiting for the cluster&hellip;</div>
+        <div class="route" id="route"></div>
+        <table class="cluster" aria-label="Cluster state">
+          <thead><tr><th>Node</th><th>Shard 0</th><th>Shard 1</th><th>Shard 2</th><th></th></tr></thead>
+          <tbody id="clusterRows"></tbody>
+        </table>
+        <div id="error" role="alert"></div>
+      </div>
+      <div>
+        <div class="eyebrow" style="margin-bottom:16px">Event stream</div>
+        <ol class="stream" id="events"></ol>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="how">
+  <div class="wrap">
+    <div class="head reveal">
+      <div><div class="eyebrow">02 &nbsp;/&nbsp; What you're watching</div><h2>Four rules <em>keep the data safe.</em></h2></div>
+      <p>Raft turns three unreliable machines into one reliable log. These are the mechanisms behind
+        every pulse and ripple in the scene above.</p>
+    </div>
+    <div class="steps reveal">
+      <article class="step">
+        <div class="n">01</div><h3>Heartbeats</h3>
+        <svg viewBox="0 0 200 120" aria-hidden="true">
+          <circle cx="40" cy="60" r="11" fill="none" stroke="var(--shard-0)" stroke-width="2"/>
+          <circle cx="160" cy="28" r="8" fill="none" stroke="var(--muted)"/><circle cx="160" cy="92" r="8" fill="none" stroke="var(--muted)"/>
+          <line x1="52" y1="56" x2="151" y2="31" stroke="var(--rule)"/><line x1="52" y1="64" x2="151" y2="89" stroke="var(--rule)"/>
+          <circle r="3" fill="var(--shard-0)"><animateMotion dur="1.4s" repeatCount="indefinite" path="M52,56 L151,31"/></circle>
+          <circle r="3" fill="var(--shard-0)"><animateMotion dur="1.4s" repeatCount="indefinite" path="M52,64 L151,89"/></circle>
+        </svg>
+        <p>The leader pings every follower every 50 ms. If a follower hears nothing for 300 to 600 ms, it assumes the leader is gone.</p>
+      </article>
+      <article class="step">
+        <div class="n">02</div><h3>Election</h3>
+        <svg viewBox="0 0 200 120" aria-hidden="true">
+          <circle cx="100" cy="60" r="10" fill="var(--shard-1)"/>
+          <circle cx="100" cy="60" r="10" fill="none" stroke="var(--shard-1)"><animate attributeName="r" values="10;56" dur="2s" repeatCount="indefinite"/><animate attributeName="opacity" values=".9;0" dur="2s" repeatCount="indefinite"/></circle>
+          <circle cx="100" cy="60" r="10" fill="none" stroke="var(--shard-1)"><animate attributeName="r" values="10;56" dur="2s" begin="1s" repeatCount="indefinite"/><animate attributeName="opacity" values=".9;0" dur="2s" begin="1s" repeatCount="indefinite"/></circle>
+          <text x="100" y="114" fill="var(--muted)" font-family="IBM Plex Mono" font-size="10" text-anchor="middle">term + 1 &middot; 2 of 3 votes</text>
+        </svg>
+        <p>A follower raises the term and asks for votes. Only a candidate whose log is up to date can win a majority, so a new leader always has every committed write.</p>
+      </article>
+      <article class="step">
+        <div class="n">03</div><h3>Replication</h3>
+        <svg viewBox="0 0 200 120" aria-hidden="true">
+          <g font-family="IBM Plex Mono" font-size="9" fill="var(--muted)">
+            <text x="8" y="26">leader</text><text x="8" y="62">node 2</text><text x="8" y="98">node 3</text>
+          </g>
+          <g fill="none" stroke="var(--rule)"><rect x="60" y="15" width="24" height="16"/><rect x="88" y="15" width="24" height="16"/><rect x="116" y="15" width="24" height="16"/>
+            <rect x="60" y="51" width="24" height="16"/><rect x="88" y="51" width="24" height="16"/><rect x="60" y="87" width="24" height="16"/></g>
+          <rect x="144" y="15" width="24" height="16" fill="var(--shard-2)"><animate attributeName="opacity" values="0;1;1" dur="3s" repeatCount="indefinite"/></rect>
+          <rect x="116" y="51" width="24" height="16" fill="var(--shard-2)"><animate attributeName="opacity" values="0;0;1;1" keyTimes="0;.33;.4;1" dur="3s" repeatCount="indefinite"/></rect>
+          <text x="186" y="66" fill="var(--shard-2)" font-family="IBM Plex Mono" font-size="9" text-anchor="end"><animate attributeName="opacity" values="0;0;1" keyTimes="0;.45;.5" dur="3s" repeatCount="indefinite"/>commit</text>
+        </svg>
+        <p>The leader appends each write to its log and copies it to followers. Once 2 of 3 have it on disk, it is committed and can never be lost.</p>
+      </article>
+      <article class="step">
+        <div class="n">04</div><h3>Recovery</h3>
+        <svg viewBox="0 0 200 120" aria-hidden="true">
+          <circle cx="100" cy="56" r="20" fill="none" stroke="var(--crash)" stroke-width="2"><animate attributeName="stroke" values="var(--crash);var(--crash);var(--ok);var(--ok)" keyTimes="0;.45;.55;1" dur="4s" repeatCount="indefinite"/></circle>
+          <path d="M100 36 A20 20 0 0 1 120 56" fill="none" stroke="var(--paper)" stroke-width="2"><animateTransform attributeName="transform" type="rotate" from="0 100 56" to="360 100 56" dur="1.2s" repeatCount="indefinite"/></path>
+          <text x="100" y="108" fill="var(--muted)" font-family="IBM Plex Mono" font-size="10" text-anchor="middle">replay log &rarr; catch up</text>
+        </svg>
+        <p>A crashed node restarts from its write-ahead log on disk, then receives the entries it missed, or a snapshot if it fell too far behind.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="numbers">
+  <div class="wrap">
+    <div class="head reveal">
+      <div><div class="eyebrow">03 &nbsp;/&nbsp; Measured, not claimed</div><h2>91&times; faster, <em>and proven correct.</em></h2></div>
+      <p>Numbers from a 3-node cluster on one laptop with 128 concurrent clients. Each step found the
+        bottleneck in the metrics first, then removed it.</p>
+    </div>
+    <div class="nums reveal">
+      <div class="num"><div class="big" data-count="5757">0</div><div class="lbl">writes / second</div><p>Up from 63 with group commit, batched replication and a shared write-ahead log.</p></div>
+      <div class="num"><div class="big" data-count="12359">0</div><div class="lbl">reads / second</div><p>ReadIndex confirms leadership with one heartbeat round instead of a log write.</p></div>
+      <div class="num"><div class="big" data-count="0.4" data-decimals="1">0</div><div class="lbl">seconds to fail over</div><p>From leader crash to a new leader serving writes, without data loss.</p></div>
+      <div class="num"><div class="big" data-count="41">0</div><div class="lbl">tests + a checker</div><p>Including Porcupine linearizability checks under random crashes and partitions.</p></div>
+    </div>
+    <div class="bars reveal" id="bars">
+      <div class="barrow"><span>fsync per write</span><div class="track"><div class="fill" data-w="1.1"></div></div><span class="val">63 /s</span></div>
+      <div class="barrow"><span>+ group commit</span><div class="track"><div class="fill" data-w="31"></div></div><span class="val">1,790 /s</span></div>
+      <div class="barrow best"><span>+ shared write-ahead log</span><div class="track"><div class="fill" data-w="100"></div></div><span class="val">5,757 /s</span></div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="code">
+  <div class="wrap">
+    <div class="head reveal">
+      <div><div class="eyebrow">04 &nbsp;/&nbsp; Inside the code</div><h2>Standard library Go, <em>no consensus library.</em></h2></div>
+      <p>Every mechanism on this page is implemented in the repository. These are the files to read first.</p>
+    </div>
+    <div class="files reveal">
+      <a class="file" href="https://github.com/Prathamesh250205/raftkv/blob/main/raft/raft.go"><code>raft/raft.go</code><span>Elections, log replication, commit rules, group commit and ReadIndex.</span><em>&sect;5, &sect;8</em></a>
+      <a class="file" href="https://github.com/Prathamesh250205/raftkv/blob/main/raft/membership.go"><code>raft/membership.go</code><span>Adding and removing nodes one at a time while the cluster serves traffic.</span><em>thesis &sect;4</em></a>
+      <a class="file" href="https://github.com/Prathamesh250205/raftkv/blob/main/raft/sharedlog.go"><code>raft/sharedlog.go</code><span>One CRC-checked write-ahead log per node, shared by every shard, one fsync per batch.</span><em>storage</em></a>
+      <a class="file" href="https://github.com/Prathamesh250205/raftkv/blob/main/server/node.go"><code>server/node.go</code><span>Multi-Raft sharding, leader balancing and the shared HTTP and RPC port.</span><em>sharding</em></a>
+      <a class="file" href="https://github.com/Prathamesh250205/raftkv/blob/main/kv/linearizability_test.go"><code>kv/linearizability_test.go</code><span>Clients, crashes and partitions, with the history checked by Porcupine.</span><em>correctness</em></a>
+      <a class="file" href="https://github.com/Prathamesh250205/raftkv/blob/main/cmd/kvwasm/main.go"><code>cmd/kvwasm/main.go</code><span>This page's cluster: the same packages compiled to WebAssembly.</span><em>you are here</em></a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="sig">raftkv <em>by Prathamesh Gulavani</em></div>
+    <p>Go &middot; Raft &middot; WebAssembly &middot; <a href="https://github.com/Prathamesh250205/raftkv">source on GitHub</a><br>
+      A sandbox: one node may be down at a time, and data resets when the page reloads.</p>
+  </div>
+</footer>
+
 <script>
-const $ = (id) => document.getElementById(id);
-let state = null;
-
-// The page talks to the cluster through one small interface, so it works both
-// against cmd/kvdemo (HTTP) and against the WebAssembly build (window.raftkv).
+// ---------- data layer: the same page drives cmd/kvdemo (HTTP) or the WebAssembly cluster ----------
 const mode = document.querySelector('meta[name="raftkv-mode"]').content;
 const httpApi = {
   async state() { const r = await fetch("api/state", { cache: "no-store" }); return r.ok ? r.json() : null; },
@@ -116,83 +399,388 @@ const wasmApi = {
   put: (key, value) => window.raftkv.put(key, value),
   get: (key) => window.raftkv.get(key),
 };
-const api = mode === "wasm" ? wasmApi : httpApi;
-
-function loadWasm() {
-  return new Promise((resolve, reject) => {
-    window.addEventListener("raftkv-ready", resolve, { once: true });
-    const script = document.createElement("script");
-    script.src = "wasm_exec.js";
-    script.onerror = reject;
-    script.onload = async () => {
+window.raftkvApi = mode === "wasm" ? wasmApi : httpApi;
+window.raftkvReady = mode !== "wasm" ? Promise.resolve() : new Promise((resolve, reject) => {
+  window.addEventListener("raftkv-ready", resolve, { once: true });
+  const s = document.createElement("script");
+  s.src = "wasm_exec.js";
+  s.onerror = reject;
+  s.onload = async () => {
+    try {
       const go = new Go();
       const { instance } = await WebAssembly.instantiateStreaming(fetch("raftkv.wasm"), go.importObject);
       go.run(instance);
-    };
-    document.head.appendChild(script);
-  });
+    } catch (e) { reject(e); }
+  };
+  document.head.appendChild(s);
+});
+</script>
+
+<script type="module">
+const api = window.raftkvApi;
+const $ = (id) => document.getElementById(id);
+const SHARDS = 3;
+const SHARD_COLORS = [0xffb547, 0x4fd1c5, 0xff7a85];
+const SHARD_CSS = ["var(--shard-0)", "var(--shard-1)", "var(--shard-2)"];
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function shardFor(key) { // FNV-1a 32-bit, the same as kv.ShardFor
+  let h = 0x811c9dc5;
+  for (const c of new TextEncoder().encode(key)) { h ^= c; h = Math.imul(h, 0x01000193) >>> 0; }
+  return h % SHARDS;
 }
+const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// ---------- 3D scene ----------
+let scene3d = null;
+try { scene3d = await buildScene(); } catch (e) { console.warn("3D scene unavailable:", e); document.body.classList.add("noscene"); }
+
+async function buildScene() {
+  const THREE = await import("three");
+  const { EffectComposer } = await import("three/addons/postprocessing/EffectComposer.js");
+  const { RenderPass } = await import("three/addons/postprocessing/RenderPass.js");
+  const { UnrealBloomPass } = await import("three/addons/postprocessing/UnrealBloomPass.js");
+  const { OutputPass } = await import("three/addons/postprocessing/OutputPass.js");
+  const { CSS2DRenderer, CSS2DObject } = await import("three/addons/renderers/CSS2DRenderer.js");
+
+  const host = $("scene");
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  host.appendChild(renderer.domElement);
+  const labelRenderer = new CSS2DRenderer();
+  labelRenderer.domElement.style.position = "absolute";
+  labelRenderer.domElement.style.inset = "0";
+  labelRenderer.domElement.style.pointerEvents = "none";
+  $("labels").appendChild(labelRenderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x0a0c0f, 0.055);
+  const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 100);
+  const target = new THREE.Vector3(0, -0.15, 0);
+
+  scene.add(new THREE.AmbientLight(0x8899aa, 0.35));
+  const key = new THREE.PointLight(0xffe2b8, 18, 30); key.position.set(3, 6, 4); scene.add(key);
+  const rim = new THREE.PointLight(0x4fd1c5, 10, 30); rim.position.set(-5, 2, -4); scene.add(rim);
+
+  // floor: radar rings and a dotted grid
+  const floorY = -1.35;
+  const floor = new THREE.Group(); floor.position.y = floorY; scene.add(floor);
+  for (let r = 1; r <= 7; r++) {
+    const ring = new THREE.Mesh(new THREE.RingGeometry(r * 0.95, r * 0.95 + 0.006, 128),
+      new THREE.MeshBasicMaterial({ color: 0x3a4250, transparent: true, opacity: 0.55 - r * 0.06, side: THREE.DoubleSide }));
+    ring.rotation.x = -Math.PI / 2; floor.add(ring);
+  }
+  {
+    const pts = [];
+    for (let x = -14; x <= 14; x++) for (let z = -14; z <= 14; z++) if (x * x + z * z < 196) pts.push(x * 0.5, 0, z * 0.5);
+    const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
+    floor.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x2b313b, size: 0.025 })));
+  }
+  // drifting dust for depth
+  const dust = (() => {
+    const n = 420, pos = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) { pos[i * 3] = (Math.random() - .5) * 22; pos[i * 3 + 1] = Math.random() * 7 - 1.5; pos[i * 3 + 2] = (Math.random() - .5) * 22; }
+    const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    const p = new THREE.Points(g, new THREE.PointsMaterial({ color: 0x8a94a6, size: 0.02, transparent: true, opacity: .55 }));
+    scene.add(p); return p;
+  })();
+
+  // nodes
+  const R = 2.55;
+  const nodes = [1, 2, 3].map((id, i) => {
+    const a = -Math.PI / 2 + i * (2 * Math.PI / 3) + Math.PI;
+    const pos = new THREE.Vector3(Math.cos(a) * R, 0, Math.sin(a) * R);
+    const group = new THREE.Group(); group.position.copy(pos); scene.add(group);
+    const coreMat = new THREE.MeshStandardMaterial({ color: 0x14181e, emissive: 0xdfe7f2, emissiveIntensity: 0.34, roughness: 0.35, metalness: 0.6 });
+    const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.4, 4), coreMat); core.userData.nodeId = id; group.add(core);
+    const shell = new THREE.Mesh(new THREE.IcosahedronGeometry(0.47, 1), new THREE.MeshBasicMaterial({ color: 0x9fb0c8, wireframe: true, transparent: true, opacity: 0.12 }));
+    group.add(shell);
+    const rings = [0, 1, 2].map((s) => {
+      const m = new THREE.MeshBasicMaterial({ color: SHARD_COLORS[s], transparent: true, opacity: 0.18 });
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.72 + s * 0.17, s === 0 ? 0.016 : 0.012, 12, 160), m);
+      ring.rotation.set(Math.PI / 2 + (s - 1) * 0.55, s * 0.9, 0);
+      group.add(ring);
+      return ring;
+    });
+    const el = document.createElement("div"); el.className = "nlabel";
+    const label = new CSS2DObject(el); label.position.set(0, 1.35, 0); group.add(label);
+    return { id, pos, group, core, coreMat, shell, rings, el, up: true, restartAt: 0, wobble: Math.random() * 6 };
+  });
+
+  // links between nodes
+  const linkMat = new THREE.LineBasicMaterial({ color: 0x2c333e, transparent: true, opacity: 0.9 });
+  for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) {
+    scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(arc(nodes[i].pos, nodes[j].pos, 24)), linkMat));
+  }
+  function arc(a, b, n) {
+    const mid = a.clone().add(b).multiplyScalar(0.5); mid.y += 0.55;
+    const curve = new THREE.QuadraticBezierCurve3(a, mid, b);
+    return curve.getPoints(n);
+  }
+
+  // effects: packets, ripples, bursts
+  const fx = [];
+  const packetGeo = new THREE.SphereGeometry(1, 12, 12);
+  function packet(from, to, color, size = 0.045, dur = 0.55, onArrive) {
+    const a = nodes[from - 1].pos, b = nodes[to - 1].pos;
+    const mid = a.clone().add(b).multiplyScalar(0.5); mid.y += 0.55;
+    const curve = new THREE.QuadraticBezierCurve3(a, mid, b);
+    const mesh = new THREE.Mesh(packetGeo, new THREE.MeshBasicMaterial({ color, transparent: true }));
+    mesh.scale.setScalar(size); scene.add(mesh);
+    fx.push({ t: 0, dur, update(t) { mesh.position.copy(curve.getPoint(Math.min(t, 1))); mesh.material.opacity = t < .85 ? 1 : (1 - t) / .15; },
+              done() { scene.remove(mesh); mesh.material.dispose(); onArrive && onArrive(); } });
+  }
+  function ripple(nodeId, color, max = 3.2, dur = 1.6) {
+    const ring = new THREE.Mesh(new THREE.RingGeometry(0.98, 1, 96), new THREE.MeshBasicMaterial({ color, transparent: true, side: THREE.DoubleSide }));
+    ring.rotation.x = -Math.PI / 2; ring.position.copy(nodes[nodeId - 1].pos); ring.position.y = floorY + 0.01; scene.add(ring);
+    fx.push({ t: 0, dur, update(t) { const e = 1 - Math.pow(1 - t, 3); ring.scale.setScalar(0.4 + e * max); ring.material.opacity = (1 - t) * 0.9; },
+              done() { scene.remove(ring); ring.geometry.dispose(); ring.material.dispose(); } });
+  }
+  function burst(nodeId, color) {
+    const n = 260, pos = new Float32Array(n * 3), vel = [];
+    for (let i = 0; i < n; i++) {
+      const d = new THREE.Vector3().randomDirection().multiplyScalar(0.8 + Math.random() * 2.6);
+      vel.push(d); pos.set([0, 0, 0], i * 3);
+    }
+    const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    const p = new THREE.Points(g, new THREE.PointsMaterial({ color, size: 0.05, transparent: true }));
+    p.position.copy(nodes[nodeId - 1].pos); scene.add(p);
+    fx.push({ t: 0, dur: 1.5, update(t) {
+        const e = 1 - Math.pow(1 - t, 2);
+        for (let i = 0; i < n; i++) { pos[i * 3] = vel[i].x * e; pos[i * 3 + 1] = vel[i].y * e - t * t * 0.9; pos[i * 3 + 2] = vel[i].z * e; }
+        g.attributes.position.needsUpdate = true; p.material.opacity = 1 - t;
+      }, done() { scene.remove(p); g.dispose(); p.material.dispose(); } });
+  }
+
+  // composer with bloom
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.75, 0.45, 0.2);
+  composer.addPass(bloom);
+  composer.addPass(new OutputPass());
+
+  function resize() {
+    const w = host.clientWidth, h = host.clientHeight;
+    renderer.setSize(w, h); composer.setSize(w, h); labelRenderer.setSize(w, h);
+    camera.aspect = w / h;
+    camera.fov = w < 700 ? 50 : 36;
+    // Frame the cluster beside the copy on wide screens, or centred on the
+    // stage area below the copy on narrow ones.
+    if (w > 900) {
+      camera.setViewOffset(w, h, -w * 0.235, -h * 0.03, w, h);
+    } else {
+      const stage = $("stage").getBoundingClientRect(), box = host.getBoundingClientRect();
+      const centerY = stage.top - box.top + stage.height / 2;
+      camera.setViewOffset(w, h, 0, -(centerY - h / 2), w, h);
+    }
+    camera.updateProjectionMatrix();
+  }
+  addEventListener("resize", resize); resize();
+  document.fonts && document.fonts.ready.then(resize); // the copy's height changes once fonts load
+
+  // pointer: parallax + click to crash
+  const mouse = new THREE.Vector2(), aim = new THREE.Vector2();
+  const ray = new THREE.Raycaster();
+  host.parentElement.addEventListener("pointermove", (e) => {
+    const r = host.getBoundingClientRect();
+    mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    ray.setFromCamera(mouse, camera);
+    const hit = ray.intersectObjects(nodes.map((n) => n.core))[0];
+    host.parentElement.style.cursor = hit && hit.object.userData.nodeId && nodes[hit.object.userData.nodeId - 1].up ? "pointer" : "";
+  });
+  host.parentElement.addEventListener("click", (e) => {
+    if (e.target.closest("a,button,input,.hud")) return;
+    ray.setFromCamera(mouse, camera);
+    const hit = ray.intersectObjects(nodes.map((n) => n.core))[0];
+    if (hit) crashNode(hit.object.userData.nodeId);
+  });
+
+  let theta = 0.35, last = performance.now(), visible = true;
+  document.addEventListener("visibilitychange", () => { visible = !document.hidden; last = performance.now(); });
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (!visible) return;
+    const dt = Math.min((now - last) / 1000, 0.05); last = now;
+    if (!reduceMotion) theta += dt * 0.045;
+    aim.lerp(mouse, 0.04);
+    // A tall, narrow screen sees a thin horizontal slice, so the camera backs off.
+    const radius = innerWidth < 700 ? 19 : 11.2, height = innerWidth < 700 ? 6.5 : 4.3;
+    camera.position.set(Math.sin(theta + aim.x * 0.25) * radius, height + aim.y * 0.7, Math.cos(theta + aim.x * 0.25) * radius);
+    camera.lookAt(target);
+    for (const n of nodes) {
+      n.wobble += dt;
+      n.group.position.y = n.up ? Math.sin(n.wobble * 1.3) * 0.07 : -0.25;
+      n.rings.forEach((r, s) => { r.rotation.z += dt * (0.25 + s * 0.12) * (s % 2 ? -1 : 1); });
+      n.shell.rotation.y += dt * 0.2; n.shell.rotation.x += dt * 0.07;
+      if (!n.up) { // flicker while down
+        n.coreMat.emissiveIntensity = 0.08 + (Math.random() < 0.06 ? 0.5 : 0);
+      }
+    }
+    dust.rotation.y += dt * 0.01;
+    for (let i = fx.length - 1; i >= 0; i--) {
+      const f = fx[i]; f.t += dt / f.dur;
+      if (f.t >= 1) { f.update(1); f.done(); fx.splice(i, 1); } else f.update(f.t);
+    }
+    composer.render(); labelRenderer.render(scene, camera);
+  }
+  requestAnimationFrame(frame);
+
+  // apply cluster state to the scene
+  function apply(state) {
+    for (const nv of state.nodes) {
+      const n = nodes[nv.id - 1];
+      if (n.up && !nv.up) { n.up = false; burst(n.id, 0xff5a5a); ripple(n.id, 0xff4d4d, 4.2, 1.8); n.coreMat.emissive.setHex(0xff3b3b); n.restartAt = performance.now() + 6000; }
+      if (!n.up && nv.up) { n.up = true; ripple(n.id, 0xdfe7f2, 3, 1.4); n.coreMat.emissive.setHex(0xdfe7f2); n.coreMat.emissiveIntensity = 0.34; }
+      n.shell.material.opacity = nv.up ? 0.12 : 0.05;
+      nv.shards.forEach((s, g) => {
+        const lead = s.state === "leader";
+        n.rings[g].material.opacity = !nv.up ? 0.0 : lead ? 1 : 0.16;
+        n.rings[g].scale.setScalar(lead ? 1.04 : 1);
+      });
+      const chips = nv.shards.map((s, g) => s.state === "leader"
+        ? `<span class="lead" style="background:${SHARD_CSS[g]}">S${g} lead</span>` : `<span>S${g}</span>`).join("");
+      const secs = Math.max(0, Math.ceil((n.restartAt - performance.now()) / 1000));
+      n.el.innerHTML = `Node ${nv.id}` + (nv.up ? `<div class="roles">${chips}</div>` : `<div class="down">crashed &middot; restarting${secs ? " in " + secs + "s" : ""}</div>`);
+    }
+  }
+  return { apply, packet, ripple, nodes };
+}
+
+// ---------- state, events and UI ----------
+let state = null, prevLeaders = [0, 0, 0], elections = 0, lastFailover = null, crashing = false;
+
+async function crashNode(id) {
+  if (crashing) return;
+  crashing = true;
+  const err = await api.crash(id);
+  $("error").textContent = err || "";
+  crashing = false;
+  poll(true);
+}
+
+function leaderOf(st, g) { const n = st.nodes.find((n) => n.up && n.shards[g].state === "leader"); return n ? n.id : 0; }
 
 function render() {
   if (!state) return;
+  scene3d && scene3d.apply(state);
+  // leader changes -> ripples
+  for (let g = 0; g < SHARDS; g++) {
+    const l = leaderOf(state, g);
+    if (l && prevLeaders[g] && l !== prevLeaders[g]) scene3d && scene3d.ripple(l, [0xffb547, 0x4fd1c5, 0xff7a85][g], 3, 1.5);
+    if (l) prevLeaders[g] = l;
+  }
+  // HUD
+  const won = state.events.filter((e) => e.text.includes("won the election"));
+  elections = won.length;
+  const m = won.length ? won[won.length - 1].text.match(/after (\d+) ms/) : null;
+  if (m) lastFailover = +m[1];
+  $("hElections").textContent = elections;
+  $("hFailover").innerHTML = lastFailover == null ? "&ndash;" : `${lastFailover}<small>ms</small>`;
+  // committed entries across all shards: each shard's highest commit index
+  let commits = 0;
+  for (let g = 0; g < SHARDS; g++) commits += Math.max(...state.nodes.map((n) => n.shards[g].commit_index || 0));
+  $("hCommits").textContent = commits.toLocaleString();
+  $("hTerm").textContent = Math.max(...state.nodes.flatMap((n) => n.shards.map((s) => s.term || 0)));
+  // busiest leader button
   const anyDown = state.nodes.some((n) => !n.up);
-  $("nodes").innerHTML = state.nodes.map((n) => `
-    <article class="panel node ${n.up ? "" : "down"}">
-      <header><h3>Node ${n.id}</h3><span class="pill ${n.up ? "up" : "down"}">${n.up ? "Up" : "Crashed"}</span></header>
-      <table><tbody>${n.shards.map((s) => `
-        <tr><td>Shard ${s.shard}</td>
-            <td><span class="role ${s.state}">${s.state === "down" ? "down" : s.state}</span></td>
-            <td class="num">${s.state === "down" ? "" : "term " + s.term}</td></tr>`).join("")}
-      </tbody></table>
-      <button class="danger" data-crash="${n.id}" ${!n.up || anyDown ? "disabled" : ""}>Crash node ${n.id}</button>
-    </article>`).join("");
-  $("events").innerHTML = state.events.slice().reverse().map((e) =>
-    `<li><time>${new Date(e.at).toLocaleTimeString()}</time>${escapeHtml(e.text)}</li>`).join("");
+  $("crashLeader").disabled = anyDown;
+  $("crashLeader").textContent = anyDown ? "One node is down; it restarts in a few seconds" : "Crash the busiest leader";
+  // table
+  $("clusterRows").innerHTML = state.nodes.map((n) => `<tr>
+      <td>Node ${n.id}</td>
+      ${n.shards.map((s, g) => `<td style="color:${s.state === "leader" ? SHARD_CSS[g] : "var(--paper-dim)"}"><span class="role ${s.state === "down" ? "down" : s.state === "leader" ? "leader" : ""}"></span>${s.state === "down" ? "down" : s.state === "leader" ? "leader" : "follower"}</td>`).join("")}
+      <td style="text-align:right"><button class="crashbtn" data-crash="${n.id}" ${!n.up || anyDown ? "disabled" : ""}>crash</button></td></tr>`).join("");
+  // events: re-render only when the log changed, and animate only the new lines
+  const keys = state.events.map((e) => e.at + e.text);
+  if (keys.join("\n") !== shownEvents.join("\n")) {
+    const seen = new Set(shownEvents);
+    $("events").innerHTML = state.events.map((e, i) => {
+      const cls = /crashed/.test(e.text) ? "crash" : /won the election/.test(e.text) ? "elect" : /restarted/.test(e.text) ? "up" : "";
+      const fresh = seen.size && !seen.has(keys[i]) ? " fresh" : "";
+      return `<li class="${cls}${fresh}"><time>${new Date(e.at).toLocaleTimeString([], { hour12: false })}</time><span>${esc(e.text)}</span></li>`;
+    }).reverse().join("");
+    shownEvents = keys;
+  }
+}
+let shownEvents = [];
+
+async function poll(once) {
+  try { const next = await api.state(); if (next) { state = next; render(); } } catch (_) {}
+  if (!once) setTimeout(poll, 300);
 }
 
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
+// heartbeats: each shard leader pings its followers, as the real leader does every 50 ms
+setInterval(() => {
+  if (!state || !scene3d || document.hidden || reduceMotion) return;
+  for (let g = 0; g < SHARDS; g++) {
+    const l = leaderOf(state, g);
+    if (!l) continue;
+    for (const n of state.nodes) if (n.up && n.id !== l) scene3d.packet(l, n.id, [0xffb547, 0x4fd1c5, 0xff7a85][g], 0.028, 0.9);
+  }
+}, 1300);
 
-async function poll() {
-  try {
-    const next = await api.state();
-    if (next) { state = next; render(); }
-  } catch (_) { /* transient; the next poll retries */ }
-  setTimeout(poll, 500);
-}
-
-$("nodes").addEventListener("click", async (e) => {
-  const id = e.target.dataset.crash;
-  if (!id) return;
-  $("error").textContent = await api.crash(id);
+$("clusterRows").addEventListener("click", (e) => { const id = e.target.dataset.crash; if (id) crashNode(+id); });
+$("crashLeader").addEventListener("click", () => {
+  if (!state) return;
+  const counts = state.nodes.map((n) => ({ id: n.id, c: n.up ? n.shards.filter((s) => s.state === "leader").length : -1 }));
+  counts.sort((a, b) => b.c - a.c);
+  crashNode(counts[0].id);
 });
 
 async function kv(method) {
   const key = $("key").value.trim();
-  if (!key) { $("result").textContent = "enter a key"; return; }
-  const started = performance.now();
+  if (!key) { $("result").textContent = "Enter a key."; return; }
+  const g = shardFor(key), leader = state ? leaderOf(state, g) : 0;
+  $("route").innerHTML = `key &rarr; shard <i style="background:${SHARD_CSS[g]}">${g}</i> &rarr; ${leader ? "leader node " + leader : "electing a leader"}`;
+  const t0 = performance.now();
   try {
     const res = method === "PUT" ? await api.put(key, $("value").value) : await api.get(key);
-    const ok = res.status >= 200 && res.status < 300;
-    const ms = Math.round(performance.now() - started);
-    if (method === "PUT") {
-      $("result").textContent = ok ? `stored "${key}" (committed by a majority, ${ms} ms)` : `error ${res.status}: ${res.body}`;
+    const ms = Math.round(performance.now() - t0), ok = res.status >= 200 && res.status < 300;
+    if (method === "PUT" && ok) {
+      $("result").innerHTML = `Stored <b>${esc(key)}</b>, committed by a majority in ${ms} ms.`;
+      const l = state ? leaderOf(state, g) : 0;
+      if (l && scene3d) for (const n of state.nodes) if (n.up && n.id !== l) scene3d.packet(l, n.id, [0xffb547, 0x4fd1c5, 0xff7a85][g], 0.075, 0.6, () => scene3d.ripple(l, [0xffb547, 0x4fd1c5, 0xff7a85][g], 1.6, 0.9));
+    } else if (ok) {
+      $("result").innerHTML = `<b>${esc(key)}</b> = "${esc(res.body)}" &nbsp;&middot;&nbsp; ${ms} ms`;
+    } else if (res.status === 404) {
+      $("result").innerHTML = `<b>${esc(key)}</b> was never written.`;
     } else {
-      $("result").textContent = ok ? `${key} = "${res.body}" (${ms} ms)` : res.status === 404 ? `"${key}" not found` : `error ${res.status}: ${res.body}`;
+      $("result").textContent = `Error ${res.status}: ${res.body}`;
     }
-  } catch (err) {
-    $("result").textContent = "request failed; try again";
-  }
+  } catch (_) { $("result").textContent = "Request failed; try again."; }
 }
 $("kvform").addEventListener("submit", (e) => { e.preventDefault(); kv("PUT"); });
 $("get").addEventListener("click", () => kv("GET"));
 
-if (mode === "wasm") {
-  $("where").textContent = "Everything runs in this browser tab: the real Raft and key-value code, compiled to WebAssembly, with the nodes connected by an in-memory network.";
-  loadWasm().then(poll).catch(() => { $("nodes").innerHTML = '<p class="hint">Could not start the cluster in this browser.</p>'; });
-} else {
+// scroll reveals, counters and bars
+const io = new IntersectionObserver((entries) => {
+  for (const en of entries) {
+    if (!en.isIntersecting) continue;
+    en.target.classList.add("in"); io.unobserve(en.target);
+    en.target.querySelectorAll("[data-count]").forEach(countUp);
+    en.target.querySelectorAll(".fill").forEach((f, i) => setTimeout(() => (f.style.width = f.dataset.w + "%"), i * 220));
+  }
+}, { threshold: 0.18 });
+document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+function countUp(el) {
+  const to = parseFloat(el.dataset.count), dec = +(el.dataset.decimals || 0), dur = reduceMotion ? 0 : 1600, t0 = performance.now();
+  const fmt = (v) => v.toLocaleString(undefined, { minimumFractionDigits: dec, maximumFractionDigits: dec });
+  (function step(now) {
+    const t = dur ? Math.min((now - t0) / dur, 1) : 1, e = 1 - Math.pow(1 - t, 4);
+    el.textContent = fmt(to * e);
+    if (t < 1) requestAnimationFrame(step);
+  })(t0);
+}
+
+// start
+$("where").textContent = mode === "wasm" ? "running in your browser (WebAssembly)" : "running on a server";
+try {
+  await window.raftkvReady;
+  $("result").textContent = "Cluster is up. Put a value, then crash its leader.";
   poll();
+} catch (e) {
+  $("result").textContent = "Could not start the cluster in this browser.";
 }
 </script>
 </body>

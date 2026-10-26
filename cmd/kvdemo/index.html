@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>raftkv live demo</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #16181d; --muted: #5f6672; --line: #e3e6eb;
+    --accent: #2f6fed; --leader: #b7791f; --leader-bg: #fdf3e1; --follower-bg: #eef2f8;
+    --down: #9aa1ab; --down-bg: #f1f2f4; --danger: #c53030; --ok: #2f855a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --panel: #171a21; --text: #e7e9ee; --muted: #9aa3b2; --line: #272c36;
+      --accent: #6b9bff; --leader: #f0b452; --leader-bg: #2e2412; --follower-bg: #1d2533;
+      --down: #6b7280; --down-bg: #1c1f26; --danger: #fc8181; --ok: #68d391;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 28px 16px 48px; }
+  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  p.lede { margin: 0 0 4px; color: var(--muted); max-width: 760px; }
+  a { color: var(--accent); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .nodes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 22px 0; }
+  .node.down { opacity: 0.7; }
+  .node header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .node h3 { margin: 0; font-size: 17px; }
+  .pill { font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 99px; }
+  .pill.up { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+  .pill.down { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td { padding: 6px 0; border-top: 1px solid var(--line); }
+  td.num { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .role { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 6px; }
+  .role.leader { color: var(--leader); background: var(--leader-bg); }
+  .role.follower { color: var(--muted); background: var(--follower-bg); }
+  .role.candidate { color: var(--accent); background: var(--follower-bg); }
+  .role.down { color: var(--down); background: var(--down-bg); }
+  button { font: inherit; font-weight: 600; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--text); padding: 7px 14px; cursor: pointer; }
+  button.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); width: 100%; margin-top: 12px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .row { display: grid; grid-template-columns: 1.1fr 1fr; gap: 14px; }
+  .kv form { display: flex; flex-wrap: wrap; gap: 8px; }
+  input { font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+          background: var(--bg); color: var(--text); min-width: 0; flex: 1 1 140px; }
+  #result { margin-top: 12px; min-height: 22px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 14px; word-break: break-word; }
+  .events ol { list-style: none; margin: 0; padding: 0; max-height: 310px; overflow: auto; font-size: 14px; }
+  .events li { padding: 6px 0; border-top: 1px solid var(--line); }
+  .events time { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 8px; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  #error { color: var(--danger); font-size: 14px; min-height: 20px; margin-top: 8px; }
+  footer { margin-top: 26px; color: var(--muted); font-size: 13px; }
+  @media (max-width: 760px) { .nodes, .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>raftkv: live demo</h1>
+  <p class="lede">A sharded key-value store built on a from-scratch implementation of the Raft consensus
+    algorithm. Three nodes each replicate three shards; every shard elects its own leader.
+    <b>Crash a node</b> and watch the surviving nodes elect a new leader, with no data lost.</p>
+  <p class="lede"><a href="https://github.com/Prathamesh250205/raftkv">Source code and design on GitHub</a></p>
+
+  <section class="nodes" id="nodes" aria-live="polite"></section>
+  <div id="error" role="alert"></div>
+
+  <div class="row">
+    <section class="panel kv">
+      <h2>Read and write</h2>
+      <form id="kvform">
+        <input id="key" placeholder="key" maxlength="64" value="greeting" aria-label="Key">
+        <input id="value" placeholder="value" maxlength="256" value="hello from the demo" aria-label="Value">
+        <button class="primary" type="submit" data-op="put">Put</button>
+        <button type="button" id="get">Get</button>
+      </form>
+      <div id="result"></div>
+      <p class="hint">Every write is committed by a majority of the shard's replicas before it is acknowledged,
+        so it survives a crash. Try: put a value, crash the node that leads its shard, then get it again.</p>
+    </section>
+    <section class="panel events">
+      <h2>What just happened</h2>
+      <ol id="events"></ol>
+    </section>
+  </div>
+
+  <footer>A public sandbox: data resets when the demo restarts, only one node can be down at a time
+    (so a majority always survives), and a crashed node restarts from its disk after 6 seconds.</footer>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let state = null;
+
+function render() {
+  if (!state) return;
+  const anyDown = state.nodes.some((n) => !n.up);
+  $("nodes").innerHTML = state.nodes.map((n) => `
+    <article class="panel node ${n.up ? "" : "down"}">
+      <header><h3>Node ${n.id}</h3><span class="pill ${n.up ? "up" : "down"}">${n.up ? "Up" : "Crashed"}</span></header>
+      <table><tbody>${n.shards.map((s) => `
+        <tr><td>Shard ${s.shard}</td>
+            <td><span class="role ${s.state}">${s.state === "down" ? "down" : s.state}</span></td>
+            <td class="num">${s.state === "down" ? "" : "term " + s.term}</td></tr>`).join("")}
+      </tbody></table>
+      <button class="danger" data-crash="${n.id}" ${!n.up || anyDown ? "disabled" : ""}>Crash node ${n.id}</button>
+    </article>`).join("");
+  $("events").innerHTML = state.events.slice().reverse().map((e) =>
+    `<li><time>${new Date(e.at).toLocaleTimeString()}</time>${escapeHtml(e.text)}</li>`).join("");
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function poll() {
+  try {
+    const res = await fetch("api/state", { cache: "no-store" });
+    if (res.ok) { state = await res.json(); render(); }
+  } catch (_) { /* transient; the next poll retries */ }
+  setTimeout(poll, 500);
+}
+
+$("nodes").addEventListener("click", async (e) => {
+  const id = e.target.dataset.crash;
+  if (!id) return;
+  $("error").textContent = "";
+  const res = await fetch(`api/crash/${id}`, { method: "POST" });
+  if (!res.ok) $("error").textContent = (await res.text()).trim();
+});
+
+async function kv(method) {
+  const key = $("key").value.trim();
+  if (!key) { $("result").textContent = "enter a key"; return; }
+  const started = performance.now();
+  const opts = { method };
+  if (method === "PUT") opts.body = $("value").value;
+  try {
+    const res = await fetch(`kv/${encodeURIComponent(key)}`, opts);
+    const ms = Math.round(performance.now() - started);
+    const body = (await res.text()).trim();
+    if (method === "PUT") {
+      $("result").textContent = res.ok ? `stored "${key}" (committed by a majority, ${ms} ms)` : `error ${res.status}: ${body}`;
+    } else {
+      $("result").textContent = res.ok ? `${key} = "${body}" (${ms} ms)` : res.status === 404 ? `"${key}" not found` : `error ${res.status}: ${body}`;
+    }
+  } catch (err) {
+    $("result").textContent = "request failed; try again";
+  }
+}
+$("kvform").addEventListener("submit", (e) => { e.preventDefault(); kv("PUT"); });
+$("get").addEventListener("click", () => kv("GET"));
+
+poll();
+</script>
+</body>
+</html>

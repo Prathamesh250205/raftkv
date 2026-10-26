@@ -125,6 +125,18 @@
   .reveal { opacity: 0; transform: translateY(26px); transition: opacity .9s cubic-bezier(.2,.7,.2,1), transform .9s cubic-bezier(.2,.7,.2,1); }
   .reveal.in { opacity: 1; transform: none; }
 
+  /* plain-words explainer: the chaos graph with numbered callouts */
+  .explain { display: grid; grid-template-columns: 1.5fr 1fr; gap: 40px; align-items: start; }
+  .explain figure { margin: 0; border: 1px solid var(--rule); background: var(--ink-2); padding: 10px; }
+  .explain img { display: block; width: 100%; height: auto; }
+  .explain figcaption { font: 400 12px/1.6 var(--mono); color: var(--muted); padding: 12px 4px 2px; }
+  .callouts { list-style: none; counter-reset: c; margin: 0; padding: 0; }
+  .callouts li { counter-increment: c; position: relative; padding: 0 0 22px 46px; color: var(--paper-dim); font-size: 15px; }
+  .callouts li::before { content: counter(c); position: absolute; left: 0; top: -2px; width: 30px; height: 30px; border: 1px solid var(--rule);
+                         display: grid; place-items: center; font: 500 13px var(--mono); color: var(--shard-0); }
+  .callouts b { color: var(--paper); font-weight: 600; }
+  @media (max-width: 900px) { .explain { grid-template-columns: 1fr; } }
+
   /* console */
   .console { display: grid; grid-template-columns: 1fr 1.15fr; gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
   .console > div { background: var(--ink-2); padding: 28px; }
@@ -215,6 +227,7 @@
 <header class="bar">
   <a class="mark" href="#top"><i></i>raftkv</a>
   <nav>
+    <a href="#plain">what is this</a>
     <a href="#console">console</a>
     <a href="#how">how it works</a>
     <a href="#numbers">numbers</a>
@@ -245,6 +258,35 @@
       <div class="stat"><div class="k">Last failover</div><div class="v" id="hFailover">&ndash;</div></div>
       <div class="stat"><div class="k">Committed entries</div><div class="v" id="hCommits">0</div></div>
       <div class="stat"><div class="k">Highest term</div><div class="v" id="hTerm">0</div></div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="plain">
+  <div class="wrap">
+    <div class="head reveal">
+      <div><div class="eyebrow">00 &nbsp;/&nbsp; In plain words</div><h2>A database that <em>survives crashes.</em></h2></div>
+      <p>Most apps keep their data on one computer. If it crashes, the app goes down, and if its disk
+        dies, the data is gone. raftkv keeps every piece of data on three computers that vote on every
+        change, so any one of them can fail at any moment and nothing is lost.</p>
+    </div>
+    <div class="explain reveal">
+      <figure>
+        <img src="https://raw.githubusercontent.com/Prathamesh250205/raftkv/main/docs/images/grafana-chaos.jpg"
+             alt="Monitoring dashboard recorded while machines in the cluster were being crashed on purpose" loading="lazy" width="1034" height="549">
+        <figcaption>Recorded during a real test: for 90 seconds a script froze, crashed and disconnected a
+          machine every few seconds (12 failures) while a client kept writing.</figcaption>
+      </figure>
+      <ol class="callouts">
+        <li><b>Shard leaders</b> (top left). The data is split into three slices, and each slice has
+          one machine in charge. When machines were crashed, node 3 took charge of all three slices.</li>
+        <li><b>Requests per second</b> (top right). The yellow line is writes that succeeded. It kept going
+          while machines failed. The small blue line is the few that arrived mid-handover.</li>
+        <li><b>Response time</b> (bottom left). The slowest requests briefly took 220 ms during a handover,
+          then fell back on their own. Nobody restarted anything.</li>
+        <li><b>Elections</b> (bottom right). Each step up is the machines voting in a new leader after one
+          failed. Result: <b>29,463 writes succeeded (95.5%)</b>, and no saved data was lost.</li>
+      </ol>
     </div>
   </div>
 </section>

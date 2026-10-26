@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- "server": talk to cmd/kvdemo over HTTP. "wasm": run the cluster in this
+     page (cmd/kvwasm); the GitHub Pages build switches this to wasm. -->
+<meta name="raftkv-mode" content="server">
 <title>raftkv live demo</title>
 <style>
   :root {
@@ -68,7 +71,8 @@
     <b>Crash a node</b> and watch the surviving nodes elect a new leader, with no data lost.</p>
   <p class="lede"><a href="https://github.com/Prathamesh250205/raftkv">Source code and design on GitHub</a></p>
 
-  <section class="nodes" id="nodes" aria-live="polite"></section>
+  <p class="lede" id="where"></p>
+  <section class="nodes" id="nodes" aria-live="polite"><p class="hint">Starting the cluster...</p></section>
   <div id="error" role="alert"></div>
 
   <div class="row">
@@ -90,12 +94,44 @@
     </section>
   </div>
 
-  <footer>A public sandbox: data resets when the demo restarts, only one node can be down at a time
-    (so a majority always survives), and a crashed node restarts from its disk after 6 seconds.</footer>
+  <footer>A sandbox: data resets when the demo restarts, only one node can be down at a time
+    (so a majority always survives), and a crashed node restarts from its saved state after 6 seconds.</footer>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
 let state = null;
+
+// The page talks to the cluster through one small interface, so it works both
+// against cmd/kvdemo (HTTP) and against the WebAssembly build (window.raftkv).
+const mode = document.querySelector('meta[name="raftkv-mode"]').content;
+const httpApi = {
+  async state() { const r = await fetch("api/state", { cache: "no-store" }); return r.ok ? r.json() : null; },
+  async crash(id) { const r = await fetch(`api/crash/${id}`, { method: "POST" }); return r.ok ? "" : (await r.text()).trim(); },
+  async put(key, value) { const r = await fetch(`kv/${encodeURIComponent(key)}`, { method: "PUT", body: value }); return { status: r.status, body: (await r.text()).trim() }; },
+  async get(key) { const r = await fetch(`kv/${encodeURIComponent(key)}`); return { status: r.status, body: (await r.text()).trim() }; },
+};
+const wasmApi = {
+  async state() { return JSON.parse(window.raftkv.state()); },
+  async crash(id) { return window.raftkv.crash(Number(id)); },
+  put: (key, value) => window.raftkv.put(key, value),
+  get: (key) => window.raftkv.get(key),
+};
+const api = mode === "wasm" ? wasmApi : httpApi;
+
+function loadWasm() {
+  return new Promise((resolve, reject) => {
+    window.addEventListener("raftkv-ready", resolve, { once: true });
+    const script = document.createElement("script");
+    script.src = "wasm_exec.js";
+    script.onerror = reject;
+    script.onload = async () => {
+      const go = new Go();
+      const { instance } = await WebAssembly.instantiateStreaming(fetch("raftkv.wasm"), go.importObject);
+      go.run(instance);
+    };
+    document.head.appendChild(script);
+  });
+}
 
 function render() {
   if (!state) return;
@@ -120,8 +156,8 @@ function escapeHtml(s) {
 
 async function poll() {
   try {
-    const res = await fetch("api/state", { cache: "no-store" });
-    if (res.ok) { state = await res.json(); render(); }
+    const next = await api.state();
+    if (next) { state = next; render(); }
   } catch (_) { /* transient; the next poll retries */ }
   setTimeout(poll, 500);
 }
@@ -129,25 +165,21 @@ async function poll() {
 $("nodes").addEventListener("click", async (e) => {
   const id = e.target.dataset.crash;
   if (!id) return;
-  $("error").textContent = "";
-  const res = await fetch(`api/crash/${id}`, { method: "POST" });
-  if (!res.ok) $("error").textContent = (await res.text()).trim();
+  $("error").textContent = await api.crash(id);
 });
 
 async function kv(method) {
   const key = $("key").value.trim();
   if (!key) { $("result").textContent = "enter a key"; return; }
   const started = performance.now();
-  const opts = { method };
-  if (method === "PUT") opts.body = $("value").value;
   try {
-    const res = await fetch(`kv/${encodeURIComponent(key)}`, opts);
+    const res = method === "PUT" ? await api.put(key, $("value").value) : await api.get(key);
+    const ok = res.status >= 200 && res.status < 300;
     const ms = Math.round(performance.now() - started);
-    const body = (await res.text()).trim();
     if (method === "PUT") {
-      $("result").textContent = res.ok ? `stored "${key}" (committed by a majority, ${ms} ms)` : `error ${res.status}: ${body}`;
+      $("result").textContent = ok ? `stored "${key}" (committed by a majority, ${ms} ms)` : `error ${res.status}: ${res.body}`;
     } else {
-      $("result").textContent = res.ok ? `${key} = "${body}" (${ms} ms)` : res.status === 404 ? `"${key}" not found` : `error ${res.status}: ${body}`;
+      $("result").textContent = ok ? `${key} = "${res.body}" (${ms} ms)` : res.status === 404 ? `"${key}" not found` : `error ${res.status}: ${res.body}`;
     }
   } catch (err) {
     $("result").textContent = "request failed; try again";
@@ -156,7 +188,12 @@ async function kv(method) {
 $("kvform").addEventListener("submit", (e) => { e.preventDefault(); kv("PUT"); });
 $("get").addEventListener("click", () => kv("GET"));
 
-poll();
+if (mode === "wasm") {
+  $("where").textContent = "Everything runs in this browser tab: the real Raft and key-value code, compiled to WebAssembly, with the nodes connected by an in-memory network.";
+  loadWasm().then(poll).catch(() => { $("nodes").innerHTML = '<p class="hint">Could not start the cluster in this browser.</p>'; });
+} else {
+  poll();
+}
 </script>
 </body>
 </html>

@@ -38,11 +38,13 @@ jobs:
       - name: build binaries
         run: go build ./cmd/...
 
+      - name: build the in-browser cluster (WebAssembly)
+        if: runner.os == 'Linux'
+        run: GOOS=js GOARCH=wasm go vet ./cmd/kvwasm && GOOS=js GOARCH=wasm go build -o /dev/null ./cmd/kvwasm
+
   docker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: build image
         run: docker build -t raftkv .
-      - name: build the Hugging Face demo image (from this commit)
-        run: docker build --build-arg RAFTKV_REF=${{ github.ref_name }} -t raftkv-demo deploy/huggingface

@@ -242,7 +242,7 @@ index**.
 
 The linearizability test has already caught one real bug: a concurrent map access when starting
 replicators, which crashed about once in 45 runs
-([fix](https://github.com/Prathamesh250205/raftkv/commit/c083f2c)).
+([fix](https://github.com/Prathamesh250205/raftkv/commit/c73d755)).
 
 ## Performance
 
@@ -324,3 +324,7 @@ multi-machine gains weren't measured here.
 - Diego Ongaro, *Consensus: Bridging Theory and Practice* (PhD thesis), Stanford, 2014
 - MIT 6.5840 Distributed Systems, Labs 3–5
 - [etcd/raft](https://github.com/etcd-io/raft), [TiKV](https://github.com/tikv/tikv), [Porcupine](https://github.com/anishathalye/porcupine)
+
+## License
+
+[MIT](LICENSE)

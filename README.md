@@ -1,6 +1,11 @@
 # raftkv
 
 [![CI](https://github.com/Prathamesh250205/raftkv/actions/workflows/ci.yml/badge.svg)](https://github.com/Prathamesh250205/raftkv/actions/workflows/ci.yml)
+[![Live demo](https://img.shields.io/badge/live%20demo-try%20it-2f6fed)](https://prathamesh250205.github.io/raftkv/)
+
+**▶ [Live demo](https://prathamesh250205.github.io/raftkv/)**: write keys, crash a node and watch Raft
+elect a new leader in about 300 ms with no data lost. The real Raft and key-value code runs
+compiled to WebAssembly in your browser, so there's nothing to install and no server to keep awake.
 
 A sharded, fault-tolerant, **linearizable** key-value store built on a from-scratch implementation
 of the [Raft consensus algorithm](https://raft.github.io/raft.pdf) in Go. The servers use only the
@@ -112,6 +117,16 @@ Requires Go 1.22 or newer.
 ```bash
 go test ./...
 ```
+
+### Live demo in your browser
+
+**https://prathamesh250205.github.io/raftkv/** runs a 3-node, 3-shard cluster inside the page:
+[`cmd/kvwasm`](cmd/kvwasm/) compiles the `raft` and `kv` packages to WebAssembly and connects the
+nodes with the same in-memory network the tests use. The dashboard
+([`cmd/kvdemo/index.html`](cmd/kvdemo/index.html)) shows each node's role per shard and lets you
+crash a node. Crashes are limited to one node at a time, so a majority always survives. A
+workflow rebuilds and publishes it on every push. To run the same dashboard against real
+networked nodes locally: `go run ./cmd/kvdemo`, then open http://localhost:7860.
 
 ### One click: GitHub Codespaces (free, nothing to install)
 

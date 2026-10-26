@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>raftkv: a database that survives crashes</title>
+<meta name="description" content="raftkv is a sharded key-value store built on a from-scratch implementation of the Raft consensus algorithm in Go. Crash a machine in the live demo and watch nothing get lost.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0a0c0f; --ink-2: #101318; --ink-3: #161a21; --rule: #232832;
+    --paper: #ece8e1; --paper-dim: #a9adb5; --muted: #6d727c;
+    --amber: #ffb547; --teal: #4fd1c5; --coral: #ff7a85; --crash: #ff4d4d; --ok: #7ee2a8;
+    --serif: "Instrument Serif", Georgia, serif; --sans: "IBM Plex Sans", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+    --gutter: clamp(16px, 4vw, 48px); --max: 1180px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--ink); color: var(--paper); font: 16px/1.6 var(--sans); -webkit-font-smoothing: antialiased; overflow-x: hidden; }
+  a { color: inherit; }
+  body::after { content: ""; position: fixed; inset: -50%; pointer-events: none; z-index: 50; opacity: .05;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    animation: grain 1.2s steps(6) infinite; }
+  @keyframes grain { 0%{transform:translate(0,0)} 33%{transform:translate(-3%,2%)} 66%{transform:translate(2%,-3%)} 100%{transform:translate(0,0)} }
+  .wrap { max-width: var(--max); margin: 0 auto; padding: 0 var(--gutter); }
+  .eyebrow { font: 500 12px/1 var(--mono); letter-spacing: .18em; text-transform: uppercase; color: var(--muted); }
+
+  .bar { position: fixed; inset: 0 0 auto 0; z-index: 20; display: flex; justify-content: space-between; align-items: center;
+         padding: 18px var(--gutter) 26px; background: linear-gradient(to bottom, rgba(10,12,15,.92), rgba(10,12,15,0)); }
+  .mark { font: 500 14px/1 var(--mono); text-decoration: none; display: flex; gap: 10px; align-items: center; }
+  .mark i { width: 9px; height: 9px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 12px var(--amber); animation: beat 1.4s ease-in-out infinite; }
+  @keyframes beat { 0%,100%{opacity:.35} 12%{opacity:1} }
+  .bar nav { display: flex; gap: 22px; align-items: center; font: 400 13px/1 var(--mono); }
+  .bar nav a { text-decoration: none; color: var(--paper-dim); }
+  .bar nav a:hover { color: var(--paper); }
+  .bar nav a.go { color: var(--ink); background: var(--paper); padding: 9px 12px; }
+  @media (max-width: 680px) { .bar nav a.hide-sm { display: none; } }
+
+  .btn { font: 500 14px/1 var(--mono); padding: 15px 20px; border: 1px solid var(--rule); color: var(--paper); text-decoration: none;
+         display: inline-flex; gap: 10px; align-items: center; transition: transform .2s, border-color .2s, background .2s; }
+  .btn:hover { transform: translateY(-1px); border-color: var(--paper-dim); }
+  .btn.primary { background: var(--amber); border-color: var(--amber); color: var(--ink); }
+  .btn.primary:hover { background: #ffc46a; }
+
+  /* hero */
+  .hero { position: relative; min-height: 100svh; display: grid; align-items: center; overflow: hidden;
+          background: radial-gradient(90% 70% at 70% 45%, #141a22 0%, var(--ink) 65%); }
+  #viz { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .hero::before { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+                  background: linear-gradient(90deg, rgba(10,12,15,.95) 0%, rgba(10,12,15,.65) 38%, rgba(10,12,15,0) 62%); }
+  .hero .wrap { position: relative; z-index: 2; width: 100%; padding-top: 90px; padding-bottom: 60px; }
+  h1 { font: 400 clamp(48px, 7vw, 100px)/.92 var(--serif); letter-spacing: -.02em; margin: 18px 0 0; max-width: 8.5em; }
+  @media (min-width: 901px) { .hero .copy { max-width: 600px; } }
+  h1 em { color: var(--amber); }
+  .lede { max-width: 31em; color: var(--paper-dim); font-size: clamp(16px, 1.5vw, 19px); margin: 24px 0 32px; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; }
+  .tags { margin-top: 30px; display: flex; flex-wrap: wrap; gap: 8px; font: 400 12px/1 var(--mono); color: var(--muted); }
+  .tags span { border: 1px solid var(--rule); padding: 7px 9px; background: rgba(10,12,15,.6); }
+  .vizcap { position: absolute; z-index: 2; right: var(--gutter); bottom: 22px; font: 400 12px/1.5 var(--mono); color: var(--muted); text-align: right; }
+  .vizcap b { color: var(--paper-dim); font-weight: 500; }
+  @media (max-width: 900px) {
+    .hero { align-items: start; }
+    .hero::before { background: linear-gradient(180deg, rgba(10,12,15,.95) 0%, rgba(10,12,15,.8) 50%, rgba(10,12,15,.1) 78%); }
+    .hero .wrap { padding-bottom: 300px; }
+    .vizcap { left: var(--gutter); text-align: left; }
+  }
+
+  /* sections */
+  section.block { padding: clamp(80px, 11vw, 140px) 0; border-top: 1px solid var(--rule); }
+  h2 { font: 400 clamp(36px, 5vw, 62px)/1.02 var(--serif); letter-spacing: -.015em; margin: 14px 0 0; max-width: 14em; }
+  h2 em { color: var(--paper-dim); }
+  .intro { color: var(--paper-dim); max-width: 38em; margin: 22px 0 56px; font-size: 17px; }
+  .reveal { opacity: 0; transform: translateY(24px); transition: opacity .9s cubic-bezier(.2,.7,.2,1), transform .9s cubic-bezier(.2,.7,.2,1); }
+  .reveal.in { opacity: 1; transform: none; }
+
+  .vs { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+  .vs > div { background: var(--ink-2); padding: 32px; }
+  .vs h3 { font: 400 28px/1.1 var(--serif); margin: 14px 0 10px; }
+  .vs p { color: var(--paper-dim); margin: 0; }
+  .vs svg { width: 100%; height: 150px; margin-top: 18px; }
+  @media (max-width: 760px) { .vs { grid-template-columns: 1fr; } }
+
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 48px; counter-reset: s; }
+  .steps article { border-top: 1px solid var(--rule); padding-top: 22px; counter-increment: s; }
+  .steps article::before { content: "0" counter(s); font: 400 13px var(--mono); color: var(--amber); }
+  .steps h3 { font: 400 32px/1.05 var(--serif); margin: 14px 0 12px; }
+  .steps p { color: var(--paper-dim); margin: 0; }
+  .steps .tech { margin-top: 14px; font: 400 12px/1.6 var(--mono); color: var(--muted); }
+  @media (max-width: 860px) { .steps { grid-template-columns: 1fr; gap: 32px; } }
+
+  .proof { display: grid; grid-template-columns: 1.45fr 1fr; gap: 44px; align-items: start; }
+  .proof figure { margin: 0; border: 1px solid var(--rule); background: var(--ink-2); padding: 10px; }
+  .proof img { display: block; width: 100%; height: auto; }
+  .proof figcaption { font: 400 12px/1.6 var(--mono); color: var(--muted); padding: 12px 4px 2px; }
+  .proof ol { list-style: none; margin: 0; padding: 0; counter-reset: c; }
+  .proof li { counter-increment: c; position: relative; padding: 0 0 20px 44px; color: var(--paper-dim); font-size: 15px; }
+  .proof li::before { content: counter(c); position: absolute; left: 0; top: -2px; width: 28px; height: 28px; border: 1px solid var(--rule);
+                      display: grid; place-items: center; font: 500 12px var(--mono); color: var(--amber); }
+  .proof b { color: var(--paper); }
+  @media (max-width: 900px) { .proof { grid-template-columns: 1fr; } }
+
+  .nums { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 72px; border-top: 1px solid var(--rule); }
+  .nums div { padding: 30px 22px 0 0; }
+  .nums div + div { padding-left: 22px; border-left: 1px solid var(--rule); }
+  .nums .big { font: 400 clamp(46px, 5.6vw, 80px)/.9 var(--serif); font-variant-numeric: tabular-nums; }
+  .nums .lbl { font: 500 11px/1.5 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin-top: 14px; }
+  @media (max-width: 760px) { .nums { grid-template-columns: 1fr 1fr; } .nums div:nth-child(3) { border-left: 0; padding-left: 0; } }
+
+  .feat { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--rule); border: 1px solid var(--rule); }
+  .feat div { background: var(--ink); padding: 26px; }
+  .feat h4 { font: 500 15px/1.3 var(--sans); margin: 0 0 8px; }
+  .feat p { margin: 0; color: var(--paper-dim); font-size: 14.5px; }
+  .feat code { font: 400 12px var(--mono); color: var(--muted); display: block; margin-top: 12px; }
+  @media (max-width: 900px) { .feat { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 560px) { .feat { grid-template-columns: 1fr; } }
+
+  .try { text-align: center; padding: clamp(90px, 13vw, 170px) 0; border-top: 1px solid var(--rule);
+         background: radial-gradient(60% 70% at 50% 100%, rgba(255,181,71,.10), transparent 70%); }
+  .try h2 { margin: 14px auto 0; }
+  .try p { color: var(--paper-dim); max-width: 34em; margin: 20px auto 34px; }
+  .try .cta { justify-content: center; }
+  .run { margin: 54px auto 0; max-width: 560px; text-align: left; border: 1px solid var(--rule); background: var(--ink-2); padding: 18px 20px; font: 400 13px/1.9 var(--mono); color: var(--paper-dim); overflow-x: auto; }
+  .run span { color: var(--muted); }
+
+  footer { border-top: 1px solid var(--rule); padding: 44px 0 60px; }
+  footer .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 18px; font: 400 13px/1.7 var(--mono); color: var(--muted); }
+  footer b { color: var(--paper); font: 400 26px/1 var(--serif); }
+
+  @media (prefers-reduced-motion: reduce) { body::after, .mark i { animation: none; } .reveal { opacity: 1; transform: none; transition: none; } }
+</style>
+</head>
+<body>
+<header class="bar">
+  <a class="mark" href="#top"><i></i>raftkv</a>
+  <nav>
+    <a class="hide-sm" href="#how">how it works</a>
+    <a class="hide-sm" href="#proof">proof</a>
+    <a class="hide-sm" href="https://github.com/Prathamesh250205/raftkv">github &#8599;</a>
+    <a class="go" href="demo/">live demo</a>
+  </nav>
+</header>
+
+<section class="hero" id="top">
+  <canvas id="viz" aria-hidden="true"></canvas>
+  <div class="wrap"><div class="copy">
+    <div class="eyebrow">Distributed systems &middot; built from scratch in Go</div>
+    <h1>A database that <em>survives crashes.</em></h1>
+    <p class="lede">raftkv stores every piece of data on three machines that vote on every change.
+      Any one of them can fail at any moment, and nothing is lost. You can try to break it yourself.</p>
+    <div class="cta">
+      <a class="btn primary" href="demo/">Launch the live demo &rarr;</a>
+      <a class="btn" href="#how">How it works</a>
+    </div>
+    <div class="tags"><span>Raft consensus</span><span>Sharding</span><span>Snapshots</span><span>41 tests</span><span>Linearizability checked</span></div>
+  </div></div>
+  <div class="vizcap" id="vizcap"><b>Illustration:</b> the leader sends heartbeats, then crashes</div>
+</section>
+
+<section class="block" id="problem">
+  <div class="wrap">
+    <div class="eyebrow reveal">The problem</div>
+    <h2 class="reveal">One computer is a <em>single point of failure.</em></h2>
+    <p class="intro reveal">If the only machine holding your data crashes, your app goes down. If its disk dies,
+      the data is gone. Keeping copies on several machines fixes that, but creates a harder problem:
+      how do they agree on what the data is when messages are lost and machines fail mid-update?</p>
+    <div class="vs reveal">
+      <div>
+        <div class="eyebrow">Without raftkv</div>
+        <h3>One copy, one crash away from loss</h3>
+        <p>A single server takes every write. When it fails, everything stops, and unsaved changes vanish.</p>
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <circle cx="150" cy="70" r="26" fill="none" stroke="var(--crash)" stroke-width="2">
+            <animate attributeName="opacity" values="1;1;.15;1" keyTimes="0;.6;.7;1" dur="3s" repeatCount="indefinite"/></circle>
+          <path d="M138 58 L162 82 M162 58 L138 82" stroke="var(--crash)" stroke-width="2"><animate attributeName="opacity" values="0;0;1;0" keyTimes="0;.6;.7;1" dur="3s" repeatCount="indefinite"/></path>
+          <text x="150" y="128" fill="var(--muted)" font-family="IBM Plex Mono" font-size="11" text-anchor="middle">server down = app down</text>
+        </svg>
+      </div>
+      <div>
+        <div class="eyebrow">With raftkv</div>
+        <h3>Three copies that agree on every change</h3>
+        <p>Every write is confirmed by a majority before it counts. Lose any one machine and the other two carry on.</p>
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <line x1="80" y1="70" x2="150" y2="32" stroke="var(--rule)"/><line x1="80" y1="70" x2="220" y2="70" stroke="var(--rule)"/><line x1="150" y1="32" x2="220" y2="70" stroke="var(--rule)"/>
+          <circle cx="80" cy="70" r="16" fill="none" stroke="var(--crash)" stroke-width="2"><animate attributeName="stroke" values="var(--amber);var(--amber);var(--crash);var(--crash);var(--amber)" keyTimes="0;.45;.5;.9;1" dur="4s" repeatCount="indefinite"/></circle>
+          <circle cx="150" cy="32" r="13" fill="none" stroke="var(--muted)" stroke-width="2"><animate attributeName="stroke" values="var(--muted);var(--muted);var(--amber);var(--amber);var(--muted)" keyTimes="0;.55;.6;.9;1" dur="4s" repeatCount="indefinite"/></circle>
+          <circle cx="220" cy="70" r="13" fill="none" stroke="var(--muted)" stroke-width="2"/>
+          <text x="150" y="128" fill="var(--muted)" font-family="IBM Plex Mono" font-size="11" text-anchor="middle">leader fails &rarr; new leader in ~0.4 s</text>
+        </svg>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="how">
+  <div class="wrap">
+    <div class="eyebrow reveal">How it works</div>
+    <h2 class="reveal">Three ideas, <em>no magic.</em></h2>
+    <p class="intro reveal">raftkv implements the Raft consensus algorithm, which is also what powers Kubernetes' etcd,
+      CockroachDB and TiKV. Everything below is code written for this project, not a library.</p>
+    <div class="steps reveal">
+      <article>
+        <h3>Elect a leader</h3>
+        <p>One machine leads and sends a heartbeat every 50 ms. If the others stop hearing it, they vote in a
+          new leader. A machine wins only with a majority, and only if it already has all saved data.</p>
+        <div class="tech">raft/raft.go &middot; terms, randomized timeouts</div>
+      </article>
+      <article>
+        <h3>Agree before saving</h3>
+        <p>Every write goes to the leader, which copies it to the others. It counts as saved only once two of
+          the three machines have written it to disk, so a single failure can never erase it.</p>
+        <div class="tech">replication &middot; group commit &middot; write-ahead log</div>
+      </article>
+      <article>
+        <h3>Recover automatically</h3>
+        <p>A crashed machine reloads its log from disk when it returns, then receives whatever it missed,
+          or a compact snapshot if it fell far behind. Nobody has to fix anything by hand.</p>
+        <div class="tech">snapshots &middot; InstallSnapshot</div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="proof">
+  <div class="wrap">
+    <div class="eyebrow reveal">Proof</div>
+    <h2 class="reveal">We crashed it on purpose. <em>Here is what happened.</em></h2>
+    <p class="intro reveal">For 90 seconds, a script froze, crashed and disconnected a machine every few seconds
+      (12 failures in total) while a client kept writing. This is the monitoring dashboard from that run.</p>
+    <div class="proof reveal">
+      <figure>
+        <img src="https://raw.githubusercontent.com/Prathamesh250205/raftkv/main/docs/images/grafana-chaos.jpg"
+             alt="Monitoring dashboard recorded while machines were being crashed on purpose" loading="lazy" width="1034" height="549">
+        <figcaption>Grafana dashboard, recorded live during scripts/chaos.sh</figcaption>
+      </figure>
+      <ol>
+        <li><b>Who's in charge</b> (top left). The data is split into three slices; when machines failed,
+          node 3 took charge of all of them.</li>
+        <li><b>Writes per second</b> (top right). The yellow line is successful writes, and it never stopped.</li>
+        <li><b>Response time</b> (bottom left). Brief spikes to 220 ms during handovers, then back to normal on its own.</li>
+        <li><b>Elections</b> (bottom right). Each step is a new leader being voted in.
+          <b>29,463 writes succeeded; no saved data was lost.</b></li>
+      </ol>
+    </div>
+    <div class="nums reveal">
+      <div><div class="big">5,757</div><div class="lbl">writes per second</div></div>
+      <div><div class="big">91&times;</div><div class="lbl">faster than v1</div></div>
+      <div><div class="big">0.4 s</div><div class="lbl">to replace a leader</div></div>
+      <div><div class="big">41</div><div class="lbl">automated tests</div></div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="inside">
+  <div class="wrap">
+    <div class="eyebrow reveal">For engineers</div>
+    <h2 class="reveal">What's inside.</h2>
+    <p class="intro reveal">Written in Go using only the standard library, with tests for every part.</p>
+    <div class="feat reveal">
+      <div><h4>Raft consensus</h4><p>Leader election, log replication and commit by majority, from the Raft paper.</p><code>raft/raft.go</code></div>
+      <div><h4>Sharding</h4><p>Keys are split across independent Raft groups, with leaders balanced across machines.</p><code>server/node.go</code></div>
+      <div><h4>Fast, safe reads</h4><p>ReadIndex confirms leadership with one heartbeat round: 19&times; faster than reading through the log.</p><code>raft/raft.go</code></div>
+      <div><h4>Shared write-ahead log</h4><p>One CRC-checked log per machine, one disk flush for many writes across all shards.</p><code>raft/sharedlog.go</code></div>
+      <div><h4>Live membership changes</h4><p>Add or remove machines without downtime, one at a time.</p><code>raft/membership.go</code></div>
+      <div><h4>Proven correct</h4><p>A chaos test checks every result with the Porcupine linearizability checker.</p><code>kv/linearizability_test.go</code></div>
+    </div>
+  </div>
+</section>
+
+<section class="try" id="try">
+  <div class="wrap">
+    <div class="eyebrow reveal">Try it</div>
+    <h2 class="reveal">Don't take our word for it. <em>Break it.</em></h2>
+    <p class="reveal">The live demo runs the real cluster in your browser: three machines, three data slices. Save a value,
+      crash the machine in charge, and read your value back.</p>
+    <div class="cta reveal">
+      <a class="btn primary" href="demo/">Launch the live demo &rarr;</a>
+      <a class="btn" href="https://github.com/Prathamesh250205/raftkv">Read the source</a>
+    </div>
+    <div class="run reveal"><span># or run it on your own machine</span><br>git clone https://github.com/Prathamesh250205/raftkv<br>cd raftkv &amp;&amp; go test ./...<br>go run ./cmd/kvdemo&nbsp;&nbsp;<span># then open localhost:7860</span></div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div><b>raftkv</b><br>by Prathamesh Gulavani</div>
+    <div>Go &middot; Raft &middot; WebAssembly<br><a href="https://github.com/Prathamesh250205/raftkv">github.com/Prathamesh250205/raftkv</a></div>
+  </div>
+</footer>
+
+<script>
+// Hero illustration: three nodes on a 2D canvas. The leader sends heartbeats,
+// crashes, the others hold an election, and the crashed node comes back.
+(() => {
+  const canvas = document.getElementById("viz"), ctx = canvas.getContext("2d");
+  const cap = document.getElementById("vizcap");
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const C = { amber: "#ffb547", teal: "#4fd1c5", coral: "#ff7a85", crash: "#ff4d4d", node: "#dfe7f2", line: "#232832" };
+  let W, H, dpr, nodes = [], pulses = [], ripples = [];
+
+  function layout() {
+    dpr = Math.min(devicePixelRatio, 2);
+    W = canvas.clientWidth; H = canvas.clientHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const wide = W > 900;
+    const cx = wide ? W * 0.76 : W * 0.5, cy = wide ? H * 0.56 : H - 170, r = wide ? Math.min(W * 0.16, H * 0.22) : 110;
+    nodes = [0, 1, 2].map((i) => {
+      const a = -Math.PI / 2 + i * 2 * Math.PI / 3;
+      return Object.assign(nodes[i] || { up: true }, { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r, id: i + 1 });
+    });
+  }
+  addEventListener("resize", layout); layout();
+
+  let leader = 0, phase = "steady", phaseAt = performance.now(), lastBeat = 0, round = 0;
+  const say = (t) => { cap.innerHTML = "<b>Illustration:</b> " + t; };
+
+  function step(now) {
+    const t = now - phaseAt;
+    if (phase === "steady" && t > 5200) { nodes[leader].up = false; ripples.push({ x: nodes[leader].x, y: nodes[leader].y, c: C.crash, t0: now, max: 160 }); phase = "silent"; phaseAt = now; say("the leader crashes; followers stop hearing heartbeats"); }
+    else if (phase === "silent" && t > 1300) {
+      const next = [0, 1, 2].find((i) => i !== leader && nodes[i].up);
+      for (const i of [0, 1, 2]) if (i !== next && nodes[i].up) pulses.push({ a: next, b: i, t0: now, c: C.teal, vote: true });
+      phase = "voting"; phaseAt = now; say(`node ${next + 1} asks for votes (term ${round + 2})`); nodes.cand = next;
+    }
+    else if (phase === "voting" && t > 900) { const old = leader; leader = nodes.cand; round++; ripples.push({ x: nodes[leader].x, y: nodes[leader].y, c: C.amber, t0: now, max: 130 }); phase = "recovering"; phaseAt = now; say(`node ${leader + 1} wins with 2 of 3 votes and keeps serving writes`); nodes.down = old; }
+    else if (phase === "recovering" && t > 3200) { nodes[nodes.down].up = true; ripples.push({ x: nodes[nodes.down].x, y: nodes[nodes.down].y, c: C.node, t0: now, max: 110 }); phase = "steady"; phaseAt = now; say(`node ${nodes.down + 1} restarts from disk and catches up`); }
+
+    if ((phase === "steady" || phase === "recovering") && now - lastBeat > 650) {
+      lastBeat = now;
+      for (const i of [0, 1, 2]) if (i !== leader && nodes[i].up) pulses.push({ a: leader, b: i, t0: now, c: C.amber });
+    }
+
+    ctx.clearRect(0, 0, W, H);
+    // links
+    ctx.strokeStyle = C.line; ctx.lineWidth = 1;
+    for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) { ctx.beginPath(); ctx.moveTo(nodes[i].x, nodes[i].y); ctx.lineTo(nodes[j].x, nodes[j].y); ctx.stroke(); }
+    // ripples
+    ripples = ripples.filter((r) => { const p = (now - r.t0) / 1400; if (p >= 1) return false;
+      ctx.strokeStyle = r.c; ctx.globalAlpha = (1 - p) * .8; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(r.x, r.y, 20 + p * r.max, 0, Math.PI * 2); ctx.stroke(); ctx.globalAlpha = 1; return true; });
+    // pulses
+    pulses = pulses.filter((p) => { const k = (now - p.t0) / (p.vote ? 700 : 900); if (k >= 1) return false;
+      const a = nodes[p.a], b = nodes[p.b], x = a.x + (b.x - a.x) * k, y = a.y + (b.y - a.y) * k;
+      ctx.shadowColor = p.c; ctx.shadowBlur = 14; ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(x, y, p.vote ? 5 : 3.5, 0, Math.PI * 2); ctx.fill(); ctx.shadowBlur = 0; return true; });
+    // nodes
+    nodes.forEach((n, i) => {
+      const isLead = n.up && i === leader && phase !== "silent" && phase !== "voting";
+      const col = !n.up ? C.crash : isLead ? C.amber : C.node;
+      const r = isLead ? 20 : 15;
+      ctx.shadowColor = col; ctx.shadowBlur = n.up ? (isLead ? 34 : 16) : 6;
+      ctx.fillStyle = n.up ? "#0f1318" : "#1a0d0d"; ctx.strokeStyle = col; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0;
+      if (isLead) { ctx.globalAlpha = .35 + .25 * Math.sin(now / 300); ctx.beginPath(); ctx.arc(n.x, n.y, r + 9, 0, Math.PI * 2); ctx.stroke(); ctx.globalAlpha = 1; }
+      ctx.fillStyle = !n.up ? C.crash : "#a9adb5"; ctx.font = "500 11px 'IBM Plex Mono', monospace"; ctx.textAlign = "center";
+      ctx.fillText(`NODE ${n.id}${!n.up ? " · DOWN" : isLead ? " · LEADER" : ""}`, n.x, n.y + r + 24);
+    });
+    if (!reduce) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+})();
+
+// scroll reveals
+const io = new IntersectionObserver((es) => es.forEach((e) => { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } }), { threshold: .15 });
+document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+</script>
+</body>
+</html>

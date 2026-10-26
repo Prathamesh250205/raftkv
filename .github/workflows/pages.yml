@@ -25,15 +25,18 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # site/        landing page (web/index.html)
+      # site/demo/   the live cluster: dashboard + WebAssembly build
       - name: build the site
         run: |
-          mkdir -p site
-          GOOS=js GOARCH=wasm go build -trimpath -ldflags "-s -w" -o site/raftkv.wasm ./cmd/kvwasm
+          mkdir -p site/demo
+          cp web/index.html site/index.html
+          GOOS=js GOARCH=wasm go build -trimpath -ldflags "-s -w" -o site/demo/raftkv.wasm ./cmd/kvwasm
           # wasm_exec.js must come from the same Go version that built the .wasm.
-          cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" site/ 2>/dev/null || cp "$(go env GOROOT)/misc/wasm/wasm_exec.js" site/
-          sed 's/<meta name="raftkv-mode" content="server">/<meta name="raftkv-mode" content="wasm">/' cmd/kvdemo/index.html > site/index.html
-          grep -q '<meta name="raftkv-mode" content="wasm">' site/index.html
-          ls -la site
+          cp "$(go env GOROOT)/lib/wasm/wasm_exec.js" site/demo/ 2>/dev/null || cp "$(go env GOROOT)/misc/wasm/wasm_exec.js" site/demo/
+          sed 's/<meta name="raftkv-mode" content="server">/<meta name="raftkv-mode" content="wasm">/' cmd/kvdemo/index.html > site/demo/index.html
+          grep -q '<meta name="raftkv-mode" content="wasm">' site/demo/index.html
+          ls -laR site
 
       - uses: actions/upload-pages-artifact@v3
         with:
